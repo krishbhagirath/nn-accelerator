@@ -2,6 +2,7 @@
 mac_sim
 *.vcd
 *.fst
+build/
 
 # Python
 __pycache__/
