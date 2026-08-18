@@ -2,6 +2,8 @@
 // Connects the controller, memories, 4-MAC array, post-processing, and output memory.
 // External write ports allow a host/testbench to load inputs, weights, and biases.
 
+`timescale 1ns/1ps
+
 module nn_accelerator_top #(
     parameter OUTPUT_SHIFT = 0
 )(
