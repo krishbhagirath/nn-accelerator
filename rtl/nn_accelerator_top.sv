@@ -5,7 +5,7 @@
 `timescale 1ns/1ps
 
 module nn_accelerator_top #(
-    parameter OUTPUT_SHIFT = 0
+    parameter OUTPUT_SHIFT = 9
 )(
     input logic clk,
     input logic reset,
