@@ -145,66 +145,83 @@ async def test_trained_model(dut):
         Clock(dut.clk, 10, unit="ns").start()
     )
 
-    # Put accelerator into a known starting state
-    await reset_dut(dut)
-
-
     # ---------------------------------------------------------
-    # Load the trained/quantized model exported by train_model.py
+    # Load exported model/test data
     # ---------------------------------------------------------
 
-    inputs = read_values("sample_input.txt")
     flat_weights = read_values("weights.txt")
     biases = read_values("biases.txt")
-    expected = read_values("expected_output.txt")
 
+    flat_inputs = read_values("test_inputs.txt")
+    flat_expected = read_values("expected_outputs.txt")
 
-    # weights.txt contains 128 sequential values.
-    # Convert them back into 16 neurons x 8 weights.
+    # Convert 128 weights back into 16 neurons x 8 weights
     weights = [
         flat_weights[i * 8:(i + 1) * 8]
         for i in range(16)
     ]
 
+    # Convert 800 values into 100 samples x 8 inputs
+    test_inputs = [
+        flat_inputs[i * 8:(i + 1) * 8]
+        for i in range(100)
+    ]
+
+    # Convert 1600 values into 100 samples x 16 outputs
+    expected_outputs = [
+        flat_expected[i * 16:(i + 1) * 16]
+        for i in range(100)
+    ]
+
 
     # ---------------------------------------------------------
-    # Load trained model into the simulated accelerator
+    # Load model parameters once
     # ---------------------------------------------------------
 
-    await load_inputs(dut, inputs)
+    await reset_dut(dut)
+
     await load_weights(dut, weights)
     await load_biases(dut, biases)
 
 
     # ---------------------------------------------------------
-    # Run hardware inference
+    # Run 100 real samples through the accelerator
     # ---------------------------------------------------------
 
-    await run_inference(dut)
+    for sample_number in range(100):
 
-    rtl_outputs = await read_outputs(dut)
+        inputs = test_inputs[sample_number]
+        expected = expected_outputs[sample_number]
+
+        # Load only the new input.
+        # Weights/biases remain loaded from above.
+        await load_inputs(dut, inputs)
+
+        await run_inference(dut)
+
+        rtl_outputs = await read_outputs(dut)
+
+        assert rtl_outputs == expected, (
+            f"\nSample {sample_number} FAILED"
+            f"\nInput:    {inputs}"
+            f"\nExpected: {expected}"
+            f"\nRTL:      {rtl_outputs}"
+        )
+
+        dut._log.info(
+            f"Trained-model sample {sample_number + 1}/100: PASS"
+        )
+
+        # Allow controller to return DONE -> IDLE
+        dut.start.value = 0
+
+        await RisingEdge(dut.clk)
+        await RisingEdge(dut.clk)
 
 
-    # ---------------------------------------------------------
-    # Verify RTL matches quantized Python result
-    # ---------------------------------------------------------
-
-    assert rtl_outputs == expected, (
-        f"\nTrained model inference FAILED"
-        f"\nInput:    {inputs}"
-        f"\nExpected: {expected}"
-        f"\nRTL:      {rtl_outputs}"
+    dut._log.info(
+        "ALL 100 TRAINED-MODEL RTL INFERENCES PASSED"
     )
-
-    dut._log.info(f"Expected: {expected}")
-    dut._log.info(f"RTL:      {rtl_outputs}")
-    dut._log.info("TRAINED MODEL RTL INFERENCE PASSED")
-
-    # Release START so controller can return to IDLE
-    dut.start.value = 0
-
-    await RisingEdge(dut.clk)
-    await RisingEdge(dut.clk)
 
 # @cocotb.test()
 # async def test_randomized_inference(dut):

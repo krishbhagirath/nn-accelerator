@@ -207,19 +207,21 @@ print(quantized_biases)
 
 
 # ------------------------------------------------------------
-# Quantize one real test sample for the RTL accelerator
+# Use one fixed input scale for the whole model
 # ------------------------------------------------------------
 
-# Pick one sample from the test set
-sample = X_test[0]
-
-# Scale the input so the largest absolute value maps near 127
-max_input = sample.abs().max()
+# Calibrate input scale from the training data.
+# Every future sample will use this same scale.
+max_input = X_train.abs().max()
 input_scale = 127.0 / max_input
 
-quantized_input = torch.round(
-    sample * input_scale
-).clamp(-127, 127).to(torch.int8)
+# Biases must use the same accumulator scale as:
+# quantized_input * quantized_weight
+accumulator_scale = input_scale * weight_scale
+
+quantized_biases = torch.round(
+    fc1_biases * accumulator_scale
+).to(torch.int32)
 
 
 # ------------------------------------------------------------
@@ -242,41 +244,56 @@ quantized_biases = torch.round(
 # Quantized Python reference
 # ------------------------------------------------------------
 
-quantized_output = []
+# ------------------------------------------------------------
+# Quantize 100 real test samples and compute expected RTL outputs
+# ------------------------------------------------------------
 
-for neuron in range(16):
+NUM_RTL_SAMPLES = 100
 
-    total = int(quantized_biases[neuron])
+quantized_test_inputs = []
+expected_outputs = []
 
-    for i in range(8):
-        total += (
-            int(quantized_input[i])
-            * int(quantized_weights[neuron][i])
-        )
+for sample in X_test[:NUM_RTL_SAMPLES]:
 
-    # Requantize the 32-bit accumulator back toward INT8 range
-    total = total >> 9
+    # Quantize this sample using the fixed model-wide input scale
+    q_input = torch.round(
+        sample * input_scale
+    ).clamp(-127, 127).to(torch.int8)
 
-    # ReLU
-    total = max(0, total)
+    quantized_test_inputs.append(q_input)
 
-    # Saturate
-    total = min(127, total)
+    sample_outputs = []
 
-    quantized_output.append(total)
+    for neuron in range(16):
 
+        total = int(quantized_biases[neuron])
 
-print("\nOriginal test sample:")
-print(sample)
+        for i in range(8):
+            total += (
+                int(q_input[i])
+                * int(quantized_weights[neuron][i])
+            )
 
-print("\nQuantized INT8 input:")
-print(quantized_input)
+        # Match RTL post-processing
+        total = total >> 9
+        total = max(0, total)
+        total = min(127, total)
+
+        sample_outputs.append(total)
+
+    expected_outputs.append(sample_outputs)
+
 
 print("\nQuantized INT32 biases:")
 print(quantized_biases)
 
-print("\nExpected RTL first-layer outputs:")
-print(quantized_output)
+print(f"\nPrepared {NUM_RTL_SAMPLES} quantized test samples.")
+
+print("\nFirst quantized input:")
+print(quantized_test_inputs[0])
+
+print("\nFirst expected RTL output:")
+print(expected_outputs[0])
 
 
 
@@ -336,7 +353,18 @@ flat_weights = quantized_weights.flatten()
 
 write_values("weights.txt", flat_weights)
 write_values("biases.txt", quantized_biases)
-write_values("sample_input.txt", quantized_input)
-write_values("expected_output.txt", quantized_output)
+
+# Flatten 100 x 8 inputs into 800 sequential values
+flat_inputs = torch.stack(quantized_test_inputs).flatten()
+
+# Flatten 100 x 16 expected outputs into 1600 sequential values
+flat_expected = [
+    value
+    for sample_output in expected_outputs
+    for value in sample_output
+]
+
+write_values("test_inputs.txt", flat_inputs)
+write_values("expected_outputs.txt", flat_expected)
 
 print(f"\nModel data exported to: {model_data_dir}")
