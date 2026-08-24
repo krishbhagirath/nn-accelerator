@@ -8,17 +8,19 @@ from pathlib import Path
 # Location of the data exported by train_model.py
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_DATA_DIR = PROJECT_ROOT / "model_data"
+COMPILED_MODEL_DIR = PROJECT_ROOT / "compiled_model"
 
 
-def read_values(filename):
-    """Read one integer per line from an exported model-data file."""
-    with open(MODEL_DATA_DIR / filename, "r") as f:
-        return [
-            int(line.strip())
-            for line in f
-            if line.strip()
-        ]
+def read_values(folder, filename):
+    with open(folder / filename, "r") as file:
+        values = []
 
+        for line in file:
+            if line.strip():
+                values.append(int(line.strip()))
+
+        return values
+    
 # NUM_TESTS = 100
 
 # def golden_model(inputs, weights, biases):
@@ -149,11 +151,13 @@ async def test_trained_model(dut):
     # Load exported model/test data
     # ---------------------------------------------------------
 
-    flat_weights = read_values("weights.txt")
-    biases = read_values("biases.txt")
+    # Model parameters now come from our ONNX compiler
+    flat_weights = read_values(COMPILED_MODEL_DIR, "weights.txt")
+    biases = read_values(COMPILED_MODEL_DIR, "biases.txt")
 
-    flat_inputs = read_values("test_inputs.txt")
-    flat_expected = read_values("expected_outputs.txt")
+    # Test vectors still come from train_model.py
+    flat_inputs = read_values(MODEL_DATA_DIR, "test_inputs.txt")
+    flat_expected = read_values(MODEL_DATA_DIR, "expected_outputs.txt")
 
     # Convert 128 weights back into 16 neurons x 8 weights
     weights = [

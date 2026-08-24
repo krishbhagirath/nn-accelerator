@@ -214,6 +214,7 @@ print(quantized_biases)
 # Every future sample will use this same scale.
 max_input = X_train.abs().max()
 input_scale = 127.0 / max_input
+print("Input scale:", input_scale.item())
 
 # Biases must use the same accumulator scale as:
 # quantized_input * quantized_weight
@@ -368,3 +369,100 @@ write_values("test_inputs.txt", flat_inputs)
 write_values("expected_outputs.txt", flat_expected)
 
 print(f"\nModel data exported to: {model_data_dir}")
+
+
+
+# ------------------------------------------------------------
+# Evaluate quantized first-layer accuracy
+# ------------------------------------------------------------
+
+quantized_predictions = []
+
+with torch.no_grad():
+
+    for sample in X_test:
+
+        # Quantize input using the fixed model-wide scale
+        q_input = torch.round(
+            sample * input_scale
+        ).clamp(-127, 127).to(torch.int8)
+
+        # Run quantized 8 -> 16 layer in integer arithmetic
+        q_hidden = []
+
+        for neuron in range(16):
+
+            total = int(quantized_biases[neuron])
+
+            for i in range(8):
+                total += (
+                    int(q_input[i])
+                    * int(quantized_weights[neuron][i])
+                )
+
+            # Match RTL post-processing
+            total = total >> 9
+            total = max(0, total)
+            total = min(127, total)
+
+            q_hidden.append(total)
+
+        # Convert hardware-style INT8 hidden activations back to float
+        # so Python's second layer can consume them.
+        hidden_tensor = torch.tensor(
+            q_hidden,
+            dtype=torch.float32
+        )
+
+        logits = model.fc2(hidden_tensor)
+
+        prediction = torch.argmax(logits).item()
+        quantized_predictions.append(prediction)
+
+
+quantized_predictions = torch.tensor(quantized_predictions)
+
+quantized_accuracy = (
+    quantized_predictions == y_test
+).float().mean()
+
+print(
+    f"Quantized first-layer accuracy: "
+    f"{quantized_accuracy.item() * 100:.2f}%"
+)
+
+
+
+# ------------------------------------------------------------
+# Export trained model to ONNX
+# ------------------------------------------------------------
+
+dummy_input = torch.randn(1, 8)
+
+onnx_path = model_data_dir / "tiny_nn.onnx"
+
+torch.onnx.export(
+    model,
+    dummy_input,
+    onnx_path,
+    input_names=["input"],
+    output_names=["output"],
+    external_data=False
+)
+
+print(f"Exported ONNX model to: {onnx_path}")
+
+# ------------------------------------------------------------
+# Export calibration data for the ONNX compiler
+# ------------------------------------------------------------
+
+calibration_samples = X_train
+
+calibration_path = model_data_dir / "calibration_inputs.txt"
+
+with open(calibration_path, "w") as file:
+    for sample in calibration_samples:
+        for value in sample:
+            file.write(f"{float(value)}\n")
+
+print("Calibration data exported to:", calibration_path)
