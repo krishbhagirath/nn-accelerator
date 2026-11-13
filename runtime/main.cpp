@@ -3,18 +3,21 @@
 // Does exactly what a driver for the real chip would do, using the same steps
 // as the cocotb driver (sim/accelerator.py):
 //
+//   once:
+//       write the layer table, every layer's weights and biases (one value per clock)
 //   for each test sample:
-//       for each layer:
-//           load weights, biases and inputs   (one value per clock)
-//           set input_dim / output_dim / shift / relu
-//           raise start, clock until done, lower start
-//           read the outputs                  -> inputs of the next layer
-//       prediction = argmax(final outputs)
+//       write the input features
+//       set num_layers, raise start, clock until done, lower start
+//       read the final outputs; prediction = argmax(outputs)
+//
+// All layers run on chip: the host never sees intermediate activations.
 //
 // Usage:  Vnn_accelerator_top <compiled model dir> [max samples]
 // NUM_MACS is passed at compile time with -DNUM_MACS=<n> (see run_pipeline.py).
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -117,13 +120,26 @@ struct Accelerator {
 
     void reset() {
         top.reset = 1; top.start = 0;
-        top.input_write_enable = top.weight_write_enable = top.bias_write_enable = 0;
+        top.layer_write_enable = top.weight_write_enable = top.bias_write_enable = 0;
+        top.input_write_enable = 0;
         tick(); tick();
         top.reset = 0;
         tick();
     }
 
-    void load_layer(const Layer& layer) {
+    // Layer table entry + weights + biases for one layer, into table slot `index`
+    void load_layer(const Layer& layer, int index) {
+        top.layer_write_enable = 1;
+        top.layer_write_index = index;
+        top.layer_write_input_dim = layer.input_dim;
+        top.layer_write_output_dim = layer.output_dim;
+        top.layer_write_output_shift = layer.output_shift;
+        top.layer_write_relu = layer.relu;
+        tick();
+        top.layer_write_enable = 0;
+
+        top.weight_write_layer = index;
+        top.bias_write_layer = index;
         for (int n = 0; n < layer.output_dim; n++) {
             for (int i = 0; i < layer.input_dim; i++) {
                 top.weight_write_enable = 1;
@@ -141,6 +157,10 @@ struct Accelerator {
         }
     }
 
+    void load_network(const std::vector<Layer>& layers) {
+        for (size_t i = 0; i < layers.size(); i++) load_layer(layers[i], static_cast<int>(i));
+    }
+
     void load_inputs(const std::vector<int64_t>& inputs) {
         for (size_t i = 0; i < inputs.size(); i++) {
             top.input_write_enable = 1;
@@ -151,12 +171,9 @@ struct Accelerator {
         top.input_write_enable = 0;
     }
 
-    // Returns the hardware cycle_count for this layer
-    uint32_t run(const Layer& layer) {
-        top.config_input_dim = layer.input_dim;
-        top.config_output_dim = layer.output_dim;
-        top.config_output_shift = layer.output_shift;
-        top.config_relu = layer.relu;
+    // Runs the whole network; returns the hardware cycle_count
+    uint32_t run(int num_layers) {
+        top.config_num_layers = num_layers;
         top.start = 1;
         do { tick(); } while (!top.done);
         const uint32_t compute_cycles = top.cycle_count;
@@ -200,38 +217,39 @@ int main(int argc, char** argv) {
 
     Accelerator accel;
     accel.reset();
+    accel.load_network(layers);                 // once: weights stay on chip
+    const uint64_t load_cycles = accel.cycles;
 
     int bit_exact = 0, correct = 0;
-    uint64_t compute_cycles = 0, mac_operations = 0;
+    uint32_t compute_cycles = 0, mac_operations = 0;
     for (int s = 0; s < num_samples; s++) {
-        std::vector<int64_t> activations = inputs[s];
-        compute_cycles = 0;
-        mac_operations = 0;
-        for (const Layer& layer : layers) {
-            accel.load_layer(layer);
-            accel.load_inputs(activations);
-            compute_cycles += accel.run(layer);
-            mac_operations += accel.top.mac_operations;
-            activations = accel.read_outputs(layer.output_dim);
-        }
-        const bool exact = activations == expected[s];
-        const int prediction = argmax(activations);
+        accel.load_inputs(inputs[s]);
+        compute_cycles = accel.run(static_cast<int>(layers.size()));
+        mac_operations = accel.top.mac_operations;
+        const std::vector<int64_t> outputs = accel.read_outputs(layers.back().output_dim);
+
+        const bool exact = outputs == expected[s];
+        const int prediction = argmax(outputs);
         bit_exact += exact;
         correct += prediction == labels[s][0];
         if (s < 5)
             std::cout << "sample " << s << ": label=" << labels[s][0] << " RTL=" << prediction
                       << " golden=" << argmax(expected[s]) << "  " << (exact ? "PASS" : "FAIL") << "\n";
     }
+    const uint64_t inference_cycles = accel.cycles - load_cycles;
 
     std::cout << "\nmodel dir:            " << dir << "\n"
               << "NUM_MACS:             " << NUM_MACS << "\n"
+              << "layers on chip:       " << layers.size() << "\n"
               << "samples:              " << num_samples << "\n"
               << "bit-exact vs golden:  " << bit_exact << "/" << num_samples << "\n"
               << "RTL accuracy:         " << 100.0 * correct / num_samples << "%\n"
               << "compute cycles/inference (hardware counter): " << compute_cycles << "\n"
               << "MAC utilization:      "
               << 100.0 * mac_operations / (NUM_MACS * compute_cycles) << "%\n"
-              << "total simulated host cycles (incl. weight reloads): " << accel.cycles << "\n"
+              << "one-time model load cycles (reset + table + weights + biases): " << load_cycles << "\n"
+              << "host cycles per inference (inputs + run + outputs): "
+              << (num_samples ? inference_cycles / num_samples : 0) << "\n"
               << (bit_exact == num_samples ? "RESULT: PASS" : "RESULT: FAIL") << "\n";
     return bit_exact == num_samples ? 0 : 1;
 }

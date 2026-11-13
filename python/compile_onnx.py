@@ -36,6 +36,7 @@ COMPILED_DIR = PROJECT_ROOT / "compiled"
 # Must match the RTL parameters in rtl/nn_accelerator_top.sv.
 MAX_INPUTS = 64
 MAX_OUTPUTS = 32
+MAX_LAYERS = 4   # layer table entries / weight slots on chip
 MAX_SHIFT = 31  # the shift is a 5-bit field in hardware
 
 
@@ -78,6 +79,8 @@ def read_onnx_layers(onnx_path):
         else:
             raise ValueError(f"ONNX op '{node.op_type}' is not supported by the accelerator")
 
+    if len(layers) > MAX_LAYERS:
+        raise ValueError(f"model has {len(layers)} layers, hardware max is {MAX_LAYERS}")
     for i, layer in enumerate(layers):
         out_dim, in_dim = layer["weights"].shape
         if in_dim > MAX_INPUTS or out_dim > MAX_OUTPUTS:

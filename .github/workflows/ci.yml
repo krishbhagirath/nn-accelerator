@@ -1,4 +1,5 @@
-# Continuous integration: Python tests, Verilator lint, cocotb regression.
+# Continuous integration: Python tests, Verilator lint, cocotb regression,
+# and the C++ Verilator runtime on a real model.
 # Synthesis is not run here (it is slow and needs the ECP5 toolchain).
 
 name: ci
@@ -33,3 +34,6 @@ jobs:
 
       - name: Python unit tests + cocotb regression (NUM_MACS = 1, 2, 4, 8)
         run: python run_pipeline.py test
+
+      - name: C++ Verilator runtime (digits, NUM_MACS = 4)
+        run: python run_pipeline.py runtime --model digits --num-macs 4

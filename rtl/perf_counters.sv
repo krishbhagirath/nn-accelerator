@@ -1,15 +1,15 @@
-// Hardware performance counters for one layer run.
+// Hardware performance counters for one network run (all layers).
 //
 // All counters reset to 0 when a run starts and then hold their final values
 // after done, so the host can read them at any time.
 //
 //   cycle_count       cycles spent busy (COMPUTE + DRAIN states). This is the
-//                     layer's compute latency, NOT including the 1 cycle to
+//                     network's compute latency, NOT including the 1 cycle to
 //                     accept start or any host load/read cycles.
 //   mac_active_cycles cycles in which the MAC lanes were enabled.
 //   mac_operations    useful multiply-accumulates: active cycles x lanes that
 //                     hold a real neuron (unused lanes of a partial batch do
-//                     not count). Always equals input_dim * output_dim.
+//                     not count). Equals the sum of input_dim * output_dim over layers.
 //
 // Utilization = mac_operations / (NUM_MACS * cycle_count), computed in software.
 

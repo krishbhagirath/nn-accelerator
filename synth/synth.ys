@@ -5,7 +5,7 @@
 # counts (LUTs, flip-flops, DSP multipliers, block RAMs) and a real post-route
 # timing estimate without any vendor tools.
 
-read_verilog -sv rtl/sync_ram.sv rtl/mac_unit.sv rtl/post_process.sv rtl/output_memory.sv rtl/controller.sv rtl/perf_counters.sv rtl/nn_accelerator_top.sv
+read_verilog -sv rtl/sync_ram.sv rtl/mac_unit.sv rtl/post_process.sv rtl/activation_buffer.sv rtl/layer_table.sv rtl/controller.sv rtl/perf_counters.sv rtl/nn_accelerator_top.sv
 chparam -set NUM_MACS {NUM_MACS} nn_accelerator_top
 synth_ecp5 -top nn_accelerator_top -json {OUT}.json
 tee -o {OUT}_stat.txt stat

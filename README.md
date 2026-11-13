@@ -1,7 +1,8 @@
 # INT8 Neural-Network Accelerator
 
-A small, readable INT8 fully-connected neural-network accelerator in SystemVerilog,
-with the full software stack around it:
+A small, readable INT8 neural-network accelerator in SystemVerilog that runs a
+**whole fully-connected network on chip from one start pulse**, with the full
+software stack around it:
 
 ```
 PyTorch model (trained on a real dataset)
@@ -10,7 +11,7 @@ ONNX graph (Gemm / Relu only)
    ↓  python/compile_onnx.py
 INT8 model: manifest.json + weight/bias text files
    ↓  sim/accelerator.py (cocotb)   or   runtime/main.cpp (Verilator C++)
-SystemVerilog layer engine (rtl/), NUM_MACS = 1, 2, 4 or 8
+SystemVerilog accelerator (rtl/), NUM_MACS = 1, 2, 4 or 8
    ↓
 Prediction + hardware performance counters
 ```
@@ -20,61 +21,108 @@ are bit-exact against a Python integer golden model on every test sample.
 
 ## 1. What this project is
 
-The accelerator is a **generic fully-connected layer engine**. Software runs a
-network by invoking it once per layer, the way a driver launches a real
-accelerator:
+The host loads a model **once**. After that, every inference is just
+"inputs in, outputs out":
 
 ```
-for each layer:
-    load weights + biases + input activations
-    set input_dim, output_dim, output_shift, relu
-    pulse start, wait for done
-    read the INT8 outputs  -> they become the next layer's inputs
-prediction = argmax(final outputs)
+once per model:
+    write the layer table (dims, shift, relu for each layer)
+    write every layer's weights and biases          -> they stay on chip
+once per inference:
+    write the input features
+    set num_layers, pulse start, wait for done      -> all layers run on chip
+    read the final outputs
+prediction = argmax(outputs)
 ```
 
-`NUM_MACS` (how many neurons are computed in parallel) is a compile-time
-parameter. Layer sizes, shift and ReLU are run-time settings, up to
-`MAX_INPUTS = 64` and `MAX_OUTPUTS = 32`.
+The host never sees the hidden-layer activations: each layer's outputs land
+directly where the next layer reads its inputs.
 
-## 2. Architecture
+- `NUM_MACS` (how many neurons are computed in parallel) is a compile-time parameter.
+- Up to `MAX_LAYERS = 4` layers, each up to `MAX_INPUTS = 64` inputs and
+  `MAX_OUTPUTS = 32` outputs. Layer sizes, shifts and ReLU are run-time settings.
+
+## 2. One inference, end to end
+
+This is everything that happens for one digits sample (64 → 16 → 10) on 4 MACs.
+The cycle numbers are measured (see `results/`).
+
+| Step | Who | What happens | Cycles |
+|---|---|---|---|
+| 0 | host, once | write 2 layer-table entries + 1,210 weights/biases | 1,212 (one time) |
+| 1 | host | write 64 input pixels into the current activation buffer | 64 |
+| 2 | host | set `config_num_layers = 2`, raise `start` | |
+| 3 | controller | layer 0: 4 batches × 64 inputs, outputs → other buffer | 258 |
+| 4 | controller | flip buffers, load table entry 1 — same cycle, no gap | 0 |
+| 5 | controller | layer 1: 3 batches × 16 inputs, outputs → first buffer | 50 |
+| 6 | controller | flip buffers, go to DONE | |
+| 7 | host | see `done`, drop `start`, read the 10 outputs, argmax | ~13 |
+| | | **total per inference** | **385** |
+
+Doing the same inference layer-at-a-time (how the previous version of this
+engine had to work, with only one layer's weights on chip) costs **1,632**
+cycles, because the host reloads every layer's weights and copies activations
+in and out between layers. Running the network on chip is **4.24× less host
+time** for the same answer.
+
+## 3. Architecture
 
 ```
-               host writes                          host reads
-                   │                                    ▲
-   ┌───────────────┼────────────────────────────────────┼──────────────┐
-   │  input memory (64 x INT8, shared)                  │              │
-   │        │ input[i]                                  │              │
-   │        ├──► lane 0: weight bank 0 ─► MAC ─► shift/clamp ─┐        │
-   │        ├──► lane 1: weight bank 1 ─► MAC ─► shift/clamp ─┼► output│
-   │        ├──► ...                                          │  memory│
-   │        └──► lane N-1 ...                                 ┘ (32x8) │
-   │  controller (IDLE / COMPUTE / DRAIN / DONE)   perf counters       │
-   └───────────────────────────────────────────────────────────────────┘
+                 host writes                                         host reads
+                     │                                                   ▲
+ ┌───────────────────┼───────────────────────────────────────────────────┼─────┐
+ │ layer table (dims, shift, relu per layer) ──► controller ──► perf counters │
+ │                                                  │                         │
+ │  activation buffer A ◄─┐ (ping-pong: swap        │ (layer, batch, input)   │
+ │  activation buffer B ◄─┤  after every layer)     ▼                         │
+ │        │ input[i]      │                                                   │
+ │        ├──► lane 0: weight bank 0 ─► MAC ─► shift/clamp ─┐                 │
+ │        ├──► lane 1: weight bank 1 ─► MAC ─► shift/clamp ─┼─► other buffer │
+ │        └──► lane N-1 ...                                 ┘                 │
+ └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 | File | What it does |
 |---|---|
-| `rtl/nn_accelerator_top.sv` | Wires everything; `generate` loop creates `NUM_MACS` lanes |
-| `rtl/controller.sv` | Walks (batch, input) pairs; 3-stage pipeline control |
+| `rtl/nn_accelerator_top.sv` | Wires everything; `generate` loop creates `NUM_MACS` lanes and the two buffers |
+| `rtl/controller.sv` | Walks (layer, batch, input); 3-stage pipeline control; moves to the next layer |
+| `rtl/layer_table.sv` | One entry per layer: input_dim, output_dim, shift, relu |
+| `rtl/activation_buffer.sv` | One activation vector, stored as rows of `NUM_MACS` values |
 | `rtl/mac_unit.sv` | `acc = (first ? bias : acc) + input * weight` |
 | `rtl/post_process.sv` | `acc >>> shift`, then clamp to 0..127 (ReLU) or -128..127 |
 | `rtl/sync_ram.sv` | Memory with 1-cycle read latency (maps to FPGA block RAM) |
-| `rtl/output_memory.sv` | Stores a layer's outputs, `NUM_MACS` writes per batch |
-| `rtl/perf_counters.sv` | `cycle_count`, `mac_active_cycles`, `mac_operations` |
+| `rtl/perf_counters.sv` | `cycle_count`, `mac_active_cycles`, `mac_operations` for the whole run |
 | `baseline/rtl/` | The original fixed 8→16, 4-MAC design, kept for comparison |
 
-## 3. Hardware datapath
+## 4. Hardware datapath
 
 **Batching across lanes.** Neuron `n` is computed by lane `n % NUM_MACS`. Batch
 `b` computes neurons `b*NUM_MACS ... b*NUM_MACS + NUM_MACS-1`. A layer needs
 `ceil(output_dim / NUM_MACS)` batches. In the last batch, unused lanes are
 masked off: they are never written and never counted.
 
-**Weight banks.** Each lane has its own weight memory holding only its neurons:
-`bank address = (n / NUM_MACS) * MAX_INPUTS + input_index`. All lanes read the
-same address each cycle, so one counter drives everything and every bank needs
-only one read port.
+**Weight banks with a slot per layer.** Each lane has its own weight memory
+holding only its neurons, for every layer:
+
+```
+row          = layer * MAX_BATCHES + (n / NUM_MACS)
+bank address = row * MAX_INPUTS + input_index
+```
+
+All lanes read the same address each cycle, so one counter drives everything
+and every bank needs only one read port. Each layer has a fixed slot, which
+wastes some space for small layers but keeps the addressing to one line.
+
+**Ping-pong activation buffers.** There are two activation buffers. A layer
+reads its inputs from one and writes its outputs into the other; then they swap
+(`buffer_select` flips). So a layer's outputs are already in place as the next
+layer's inputs, and nothing is copied. The host always talks to the *current*
+buffer: before `start` it holds the inputs, after `done` it holds the outputs.
+
+Each buffer is stored as rows of `NUM_MACS` values, because that is exactly how
+results arrive: batch `b` writes row `b`, lane `k` writes column `k`. That keeps
+the write logic small: an earlier version where any lane could write any address
+needed 2.3× the LUTs at 4 MACs (4,474 vs 1,905).
 
 **Accumulator starts at the bias.** On a neuron's first input,
 `acc = bias + x*w`. That removes the separate "clear" and "add bias" steps.
@@ -83,26 +131,29 @@ only one read port.
 
 | Stage | What happens |
 |---|---|
-| 1 READ | controller presents (batch, input_index) to the memories |
+| 1 READ | controller presents (layer, batch, input_index) to the memories |
 | 2 MAC | data arrives; every lane accumulates |
-| 3 WRITE | after a neuron's last input, results go to output memory |
+| 3 WRITE | after a neuron's last input, results go to the other buffer |
 
 The control flags are the stage-1 conditions delayed by one or two cycles. Batch
 `b+1` starts reading while batch `b` is being written, so there are no idle
-cycles between batches:
+cycles between batches. Between layers the controller waits 2 cycles for the
+last batch to be written, and on that same cycle flips the buffers and loads the
+next layer, so:
 
 ```
-cycle_count = ceil(output_dim / NUM_MACS) * input_dim + 2
+cycle_count = sum over layers of ( ceil(output_dim / NUM_MACS) * input_dim + 2 )
 ```
 
-The cocotb tests assert this formula exactly.
+That is exactly the same compute time as running each layer separately: moving
+to the next layer costs nothing extra. The cocotb tests assert this formula.
 
 **Arithmetic.**
 - INT8 × INT8 products and an INT32 accumulator.
 - Worst case for a 64-input layer is about 2^20, far from overflow.
 - `>>>` (round toward −∞), then clamp.
 
-## 4. Software / model pipeline
+## 5. Software / model pipeline
 
 | Step | File | Output |
 |---|---|---|
@@ -112,9 +163,10 @@ The cocotb tests assert this formula exactly.
 | Run on RTL | `sim/test_model.py` via `run_pipeline.py` | per-sample outputs + counters |
 
 The compiler walks the ONNX graph and accepts only `Gemm` and `Relu`. It
-rejects anything else with a clear error.
+rejects anything else, layers over 64→32, and models over 4 layers, with a
+clear error.
 
-## 5. Quantization
+## 6. Quantization
 
 All of it lives in `compile_onnx.py`, and is deliberately simple:
 
@@ -129,7 +181,7 @@ All of it lives in `compile_onnx.py`, and is deliberately simple:
 - **Hidden layers:** ReLU, clamp 0..127.
 - **Final layer:** signed logits, clamp −128..127.
 
-## 6. Verification
+## 7. Verification
 
 Every test asserts its result automatically. Nothing relies on reading simulator
 output by eye.
@@ -141,25 +193,30 @@ output by eye.
   - ONNX checker on every model
   - onnxruntime vs our reading of the graph
   - compiled files consistent with the golden model
-- **`sim/test_accelerator.py`** (cocotb, 7 tests, run for NUM_MACS = 1, 2, 4, 8):
+- **`sim/test_accelerator.py`** (cocotb, 9 tests, run for NUM_MACS = 1, 2, 4, 8):
 
 | Test | What it checks |
 |---|---|
 | `test_reset_state` | idle and zeroed counters after reset |
 | `test_start_done_handshake` | busy/done behavior; config captured at start; rerun without reset |
 | `test_reset_during_inference` | reset mid-layer returns to idle, and the next run is correct |
-| `test_random_layers` | 40 random layers: sizes 1×1 to 64×32, non-multiples of NUM_MACS, full-range INT8, random shift/ReLU |
+| `test_random_layers` | 40 random single layers: sizes 1×1 to 64×32, non-multiples of NUM_MACS, full-range INT8, random shift/ReLU |
 | `test_extreme_values` | ±128 extremes, zeros, saturation both ways, ±2³¹ biases, shift 31, exact clamp boundaries |
 | `test_cycle_counts` | counters equal the formula above for 7 shapes |
-| `test_compiled_models` | 20 samples of every compiled model, every layer bit-exact |
+| `test_random_networks` | 24 random 1–4 layer networks, 3 back-to-back inferences each (checks the buffer swap for odd and even layer counts) |
+| `test_max_size_network` | 4 layers, 64→32→32→32→32 |
+| `test_compiled_models` | 20 samples of every compiled model, whole network on chip, bit-exact |
 
-- **`sim/test_model.py`:** full-model run of every test sample (used by the
-  benchmark and demo).
+- **`sim/test_model.py`:** every test sample of a model (used by the benchmark
+  and demo), plus the layer-at-a-time comparison.
 - **`sim/test_baseline.py`:** measures the original design on the same workload.
 - **`runtime/main.cpp`:** the C++ Verilator runtime independently re-checks
   bit-exactness.
 
-## 7. Running the project
+To check that the tests can actually catch bugs, a deliberately broken
+controller (buffers never swap) was run against them: 7 of the 9 tests failed.
+
+## 8. Running the project
 
 ```
 pip install -r requirements.txt
@@ -189,7 +246,7 @@ also works around three Windows issues:
 
 On Linux: `apt install iverilog verilator yosys nextpnr-ecp5`.
 
-## 8. Supported models
+## 9. Supported models
 
 | Model | Dataset | Layers | Parameters |
 |---|---|---|---|
@@ -206,21 +263,27 @@ On Linux: `apt install iverilog verilator yosys nextpnr-ecp5`.
 - **Pretrained models:** none from a public model hub are used. Every model is
   trained locally.
 
-## 9. Results
+## 10. Results
 
 All numbers below are copied from `results/summary.md`, which is generated by
 `run_pipeline.py`. They are measured in RTL simulation unless marked otherwise.
 
 **Per model, at NUM_MACS = 4:**
 
-| Model | Samples | Float acc | INT8 acc (Python) | RTL acc | Bit-exact | Compute cycles |
-|---|---|---|---|---|---|---|
-| tiny | 400 | 99.75% | 99.75% | 99.75% | 100% | 52 |
-| iris | 30 | 100.00% | 100.00% | 100.00% | 100% | 20 |
-| cancer | 114 | 96.49% | 96.49% | 96.49% | 100% | 140 |
-| digits | 360 | 96.67% | 96.67% | 96.67% | 100% | 308 |
-| digits_deep | 360 | 96.11% | 96.11% | 96.11% | 100% | 694 |
+| Model | Samples | Float acc | INT8 acc (Python) | RTL acc | Bit-exact | Compute cycles | Host cycles / inference | Layer-at-a-time | Less host time |
+|---|---|---|---|---|---|---|---|---|---|
+| tiny | 400 | 99.75% | 99.75% | 99.75% | 100% | 52 | 65 | 280 | 4.31× |
+| iris | 30 | 100.00% | 100.00% | 100.00% | 100% | 20 | 30 | 118 | 3.93× |
+| cancer | 114 | 96.49% | 96.49% | 96.49% | 100% | 140 | 175 | 742 | 4.24× |
+| digits | 360 | 96.67% | 96.67% | 96.67% | 100% | 308 | 385 | 1632 | 4.24× |
+| digits_deep | 360 | 96.11% | 96.11% | 96.11% | 100% | 694 | 771 | 3654 | 4.74× |
 
+- **Host cycles / inference:** write inputs + start..done + read final outputs,
+  with all weights already on chip.
+- **Layer-at-a-time:** the same inference on the same RTL, but done the way the
+  previous engine had to (reload each layer's weights, copy activations through
+  the host). The gap grows with more MACs, because compute shrinks while the
+  weight reloads don't: at 8 MACs digits_deep is **7.63×** less host time.
 - **Bit-exactness:** 1,264 test samples per MAC configuration, 0 integer
   mismatches, for all 4 configurations.
 - **Quantization effect:** INT8 accuracy equals float accuracy on these test
@@ -231,19 +294,19 @@ All numbers below are copied from `results/summary.md`, which is generated by
 **Original vs new design** (same workload: tiny layer 0, 8→16, 4 MACs, measured
 identically from start to done):
 
-| Design | start→done cycles | MAC utilization | Layers it can run |
+| Design | start→done cycles | MAC utilization | What it can run |
 |---|---|---|---|
 | original (`baseline/rtl`) | 49 | 65.3% | only 8→16 + ReLU |
-| new engine | 35 | 91.4% | any layer up to 64→32, ReLU or signed output |
+| new engine | 35 | 91.4% | any network up to 4 layers of 64→32, ReLU or signed output |
 
 That's a 28.6% latency reduction. It comes from:
 - loading the accumulator with the bias (removes CLEAR);
 - removing the idle POST_PROCESS and NEXT_BATCH states;
 - overlapping each batch's write with the next batch's reads.
 
-## 10. MAC scaling
+## 11. MAC scaling
 
-Compute cycles for one inference (sum of the hardware `cycle_count` over all layers):
+Compute cycles for one inference (the hardware `cycle_count`, all layers):
 
 | Model | 1 MAC | 2 MACs | 4 MACs | 8 MACs | Speedup 1→8 | Utilization at 8 |
 |---|---|---|---|---|---|---|
@@ -259,7 +322,7 @@ two reasons:
 - the fixed 2-cycle pipeline drain per layer;
 - partial batches. For example, a 2-output layer uses 2 of 8 lanes.
 
-## 11. Synthesis results
+## 12. Synthesis results
 
 **Flow:**
 - Lattice ECP5 LFE5U-85F, speed grade 6, using Yosys `synth_ecp5` then
@@ -268,48 +331,58 @@ two reasons:
 - Fmax is nextpnr's post-route timing estimate.
 
 **How the memories mapped:**
-- Weight banks → DP16KD block RAM.
-- Bias banks and the input memory → LUT-RAM.
-- Output memory (asynchronous read) → flip-flops.
+- Weight banks (4 layer slots each) → DP16KD block RAM.
+- Bias banks → LUT-RAM.
+- Activation buffers → LUT-RAM and/or flip-flops; Yosys decides per build. At
+  8 MACs (8 writes per cycle) LUT-RAM use drops and the flip-flop count jumps,
+  which suggests the buffers moved to flip-flops there (not confirmed per module).
 
 | MACs | LUT4 | FF | DSP | BRAM | LUT-RAM | Logic cells (P&R) | Fmax |
 |---|---|---|---|---|---|---|---|
-| 1 | 512 | 249 | 1 | 1 | 28 | 952 | 61.05 MHz |
-| 2 | 1098 | 566 | 2 | 2 | 24 | 1622 | 60.03 MHz |
-| 4 | 1859 | 693 | 4 | 4 | 40 | 2703 | 60.79 MHz |
-| 8 | 3445 | 952 | 8 | 8 | 72 | 4945 | 57.11 MHz |
+| 1 | 619 | 309 | 1 | 5 | 38 | 1115 | 60.24 MHz |
+| 2 | 1086 | 344 | 2 | 6 | 134 | 2270 | 59.00 MHz |
+| 4 | 1905 | 460 | 4 | 4 | 198 | 3693 | 58.60 MHz |
+| 8 | 4768 | 1742 | 8 | 8 | 70 | 6244 | 58.58 MHz |
 
 - **Critical path (all variants):** block-RAM read → multiply → 32-bit
-  accumulate, about 16.4–17.5 ns, in a single cycle.
-- **Throughput** (DERIVED = Fmax ÷ measured cycles; weights resident, no host
-  I/O), for digits:
-  - 51k inferences/s at 1 MAC (0.061 GMAC/s);
-  - 348k inferences/s at 8 MACs (0.41 GMAC/s).
+  accumulate, about 16.6–17.1 ns, in a single cycle.
+- **Cost of whole-network execution:** compared with the single-layer engine
+  (2,703 logic cells, 60.79 MHz at 4 MACs), holding 4 layers of weights and two
+  activation buffers costs about +37% logic cells and −3.6% Fmax at 4 MACs.
+  That is still 4.4% of this FPGA.
+- **Throughput** (DERIVED = Fmax ÷ measured compute cycles; weights resident,
+  no host I/O), for digits:
+  - 50.7k inferences/s at 1 MAC (0.060 GMAC/s);
+  - 357k inferences/s at 8 MACs (0.42 GMAC/s).
+  - Every model is in `results/summary.md`.
 - **Not available:** ASIC area and power. No standard-cell library was used.
 
-## 12. Limitations
+## 13. Limitations
 
 - **Fully-connected layers only** (Gemm + ReLU). No convolution, pooling or
   other activations.
-- **Size limits:** at most 64 inputs and 32 outputs per layer; NUM_MACS must be
-  a power of two.
+- **Size limits:** at most 4 layers, 64 inputs and 32 outputs per layer;
+  NUM_MACS must be a power of two. Each layer gets a fixed weight slot, so
+  small layers leave memory unused.
 - **Simple quantization:**
   - per-tensor scales only;
   - power-of-two rescaling only;
   - the shift rounds toward −∞ instead of to nearest;
   - the input scale is set by the single largest calibration value.
-- **Host I/O dominates small models.** The host writes one value per cycle, and
-  weights must be reloaded for every layer because only one layer fits in the
-  weight memory.
+- **Host writes one value per cycle.** For small models, writing the inputs is
+  still a noticeable part of each inference (64 of 385 cycles for digits).
 - **Fmax is limited** by the single-cycle read → multiply → accumulate path.
 - **Interface:** the host interface is direct ports, not a standard bus
-  (AXI/Wishbone).
-- **CI** (`.github/workflows/ci.yml`) is written but has not been run on GitHub yet.
+  (Avalon/AXI/Wishbone).
+- **Not run on a physical FPGA yet.** All numbers are RTL simulation or
+  post-route estimates.
 
-## 13. Future work
+## 14. Future work
 
+- Run on a DE10 board (Intel FPGA): a thin board wrapper with a bus interface
+  (Avalon-MM) and measured on-board latency.
 - Register the multiplier output (a 4-stage pipeline) to raise Fmax.
 - Round-to-nearest requantization and per-channel weight scales.
-- A wider host write port, or double-buffered weight memory, to hide load time.
+- A wider host write port to cut input-loading time.
 - A 4×4 systolic array to compare against the current lane-parallel design.
 - Convolution expressed as matrix multiply (im2col) through the same engine.

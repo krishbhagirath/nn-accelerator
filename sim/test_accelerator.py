@@ -1,7 +1,10 @@
-# Self-checking cocotb regression for the layer engine.
+# Self-checking cocotb regression for the accelerator.
 #
 # Every test compares the RTL against python/golden.py (the canonical integer
 # model) and asserts. The same tests run for every NUM_MACS build.
+#
+# Single-layer tests run each layer as a 1-layer network; the network tests
+# chain several layers on chip.
 #
 # Run through:  python run_pipeline.py test
 
@@ -12,7 +15,7 @@ import cocotb
 import numpy as np
 from cocotb.triggers import RisingEdge
 
-from accelerator import Accelerator, expected_layer_counters, golden
+from accelerator import Accelerator, expected_layer_counters, expected_network_counters, golden
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -67,18 +70,16 @@ async def test_start_done_handshake(dut):
     await accel.load_layer(layer)
     await accel.load_inputs(inputs)
 
-    dut.config_input_dim.value = 8
-    dut.config_output_dim.value = 16
-    dut.config_output_shift.value = 6
-    dut.config_relu.value = 1
+    dut.config_num_layers.value = 1
     dut.start.value = 1
     await RisingEdge(dut.clk)
     await RisingEdge(dut.clk)
     assert dut.busy.value == 1 and dut.done.value == 0
 
-    # Changing the config mid-run must not matter (it was captured at start)
-    dut.config_input_dim.value = 3
-    dut.config_output_dim.value = 1
+    # Changing the configuration mid-run must not matter: the layer count was
+    # captured at start, and the layer's table entry when the layer began.
+    dut.config_num_layers.value = 3
+    await accel.write_layer_config(0, {"input_dim": 3, "output_dim": 1, "output_shift": 0, "relu": False})
 
     await RisingEdge(dut.done)
     for _ in range(5):  # done stays high as long as start stays high
@@ -94,8 +95,12 @@ async def test_start_done_handshake(dut):
     expected = golden.fc_layer(np.array(inputs), layer["weights"], layer["biases"], 6, True)
     assert first == expected.tolist()
 
-    # Second run with no reset in between gives the same answer
-    counters = await accel.run(8, 16, 6, True)
+    # Second run with no reset in between gives the same answer (restore the
+    # table entry we overwrote, and reload the inputs: the output buffer is now
+    # the current one)
+    await accel.write_layer_config(0, layer)
+    await accel.load_inputs(inputs)
+    counters = await accel.run(1)
     assert await accel.read_outputs(16) == first
     assert counters == expected_layer_counters(8, 16, accel.num_macs)
 
@@ -111,8 +116,7 @@ async def test_reset_during_inference(dut):
     await accel.load_layer(layer)
     await accel.load_inputs(inputs)
 
-    dut.config_input_dim.value = 20
-    dut.config_output_dim.value = 12
+    dut.config_num_layers.value = 1
     dut.start.value = 1
     for _ in range(7):
         await RisingEdge(dut.clk)
@@ -126,8 +130,9 @@ async def test_reset_during_inference(dut):
     assert dut.busy.value == 0 and dut.done.value == 0
     assert int(dut.cycle_count.value) == 0
 
-    # Memories survive reset, so just run again
-    counters = await accel.run(20, 12, layer["output_shift"], layer["relu"])
+    # Weights and the layer table survive reset. Reset points the host back at
+    # buffer 0, which still holds the inputs, so just run again.
+    counters = await accel.run(1)
     outputs = await accel.read_outputs(12)
     expected = golden.fc_layer(np.array(inputs), layer["weights"], layer["biases"],
                                layer["output_shift"], layer["relu"])
@@ -215,16 +220,75 @@ async def test_cycle_counts(dut):
         lay = random_layer(rng, input_dim, output_dim)
         await accel.load_layer(lay)
         await accel.load_inputs([0] * input_dim)
-        counters = await accel.run(input_dim, output_dim, 0, False)
+        counters = await accel.run(1)
         want = expected_layer_counters(input_dim, output_dim, accel.num_macs)
         assert counters == want, f"{input_dim}x{output_dim}: {counters} != {want}"
         # Sanity: every useful MAC is counted exactly once
         assert counters["mac_operations"] == input_dim * output_dim
 
 
+def random_network(rng, num_layers):
+    """Random chained layers: layer i's output_dim is layer i+1's input_dim."""
+    dims = [rng.randint(1, 64)] + [rng.randint(1, 32) for _ in range(num_layers)]
+    layers = [random_layer(rng, dims[i], dims[i + 1],
+                           weight_range=(-40, 40), bias_range=(-3000, 3000))
+              for i in range(num_layers)]
+    # Hidden layers usually use ReLU, but test both
+    for layer in layers:
+        layer["output_shift"] = rng.randint(4, 10)
+    return layers
+
+
+async def check_network(accel, layers, samples, name):
+    """Load a network once, run every sample through it, check every output and counter."""
+    await accel.load_network(layers)
+    want = expected_network_counters(layers, accel.num_macs)
+    for number, x in enumerate(samples):
+        outputs, counters = await accel.infer(layers, x)
+        expected = golden.run_model(np.array([x], dtype=np.int64), layers)[-1][0]
+        assert outputs == expected.tolist(), (
+            f"{name} sample {number}: output mismatch\n  RTL:      {outputs}\n"
+            f"  expected: {expected.tolist()}")
+        assert counters == want, f"{name} sample {number}: counters {counters} != {want}"
+
+
+@cocotb.test()
+async def test_random_networks(dut):
+    """Random 1-4 layer networks, several back-to-back inferences each.
+
+    Back-to-back runs with odd and even layer counts check that the ping-pong
+    buffers always hand the host the right buffer.
+    """
+    accel = Accelerator(dut)
+    await accel.start()
+    rng = random.Random(77)
+    count = 0
+    for num_layers in [1, 2, 3, 4] * 6:
+        layers = random_network(rng, num_layers)
+        samples = [[rng.randint(-128, 127) for _ in range(layers[0]["input_dim"])]
+                   for _ in range(3)]
+        dims = " -> ".join(str(d) for d in [layers[0]["input_dim"]] + [l["output_dim"] for l in layers])
+        await check_network(accel, layers, samples, f"network {count} ({dims})")
+        count += 1
+    dut._log.info(f"{count} random networks bit-exact with NUM_MACS={accel.num_macs}")
+
+
+@cocotb.test()
+async def test_max_size_network(dut):
+    """A full MAX_LAYERS-deep network at the largest layer sizes."""
+    accel = Accelerator(dut)
+    await accel.start()
+    rng = random.Random(9)
+    dims = [64, 32, 32, 32, 32]
+    layers = [random_layer(rng, dims[i], dims[i + 1], shift=rng.randint(6, 12),
+                           relu=i < 3, bias_range=(-20000, 20000)) for i in range(4)]
+    samples = [[rng.randint(-128, 127) for _ in range(64)] for _ in range(3)]
+    await check_network(accel, layers, samples, "64->32->32->32->32")
+
+
 @cocotb.test()
 async def test_compiled_models(dut):
-    """First 20 test samples of every compiled model, every layer bit-exact."""
+    """First 20 test samples of every compiled model, whole network on chip, bit-exact."""
     accel = Accelerator(dut)
     await accel.start()
 
@@ -234,20 +298,5 @@ async def test_compiled_models(dut):
 
     for model_dir in model_dirs:
         manifest, layers, inputs, expected, _ = golden.load_compiled_model(model_dir)
-        samples = inputs[:20]
-        golden_per_layer = golden.run_model(samples, layers)
-
-        # Weight-stationary: load each layer once, push every sample through it
-        activations = samples.tolist()
-        for index, layer in enumerate(layers):
-            await accel.load_layer(layer)
-            next_activations = []
-            for sample_number, x in enumerate(activations):
-                outputs, _ = await accel.run_layer(layer, x)
-                assert outputs == golden_per_layer[index][sample_number].tolist(), (
-                    f"{manifest['model']} layer {index} sample {sample_number} mismatch")
-                next_activations.append(outputs)
-            activations = next_activations
-
-        assert np.array_equal(np.array(activations), expected[:20])
-        dut._log.info(f"{manifest['model']}: 20 samples bit-exact through {len(layers)} layers")
+        await check_network(accel, layers, inputs[:20].tolist(), manifest["model"])
+        dut._log.info(f"{manifest['model']}: 20 samples bit-exact through {len(layers)} layers on chip")
