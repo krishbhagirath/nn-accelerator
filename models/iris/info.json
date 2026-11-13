@@ -1,0 +1,10 @@
+{
+    "model": "iris",
+    "dataset": "iris",
+    "architecture": "4 -> 8 -> 3",
+    "num_parameters": 67,
+    "train_samples": 120,
+    "test_samples": 30,
+    "torch_float_test_accuracy": 1.0,
+    "final_train_loss": 0.04844265058636665
+}

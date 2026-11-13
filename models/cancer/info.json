@@ -1,0 +1,10 @@
+{
+    "model": "cancer",
+    "dataset": "breast_cancer",
+    "architecture": "30 -> 16 -> 2",
+    "num_parameters": 530,
+    "train_samples": 455,
+    "test_samples": 114,
+    "torch_float_test_accuracy": 0.9649122807017544,
+    "final_train_loss": 0.004432953428477049
+}

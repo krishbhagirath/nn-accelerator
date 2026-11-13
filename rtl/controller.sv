@@ -1,205 +1,171 @@
-// Controls the accelerator's execution flow.
-// Tracks which input and neuron batch are being processed.
-// Generates the high-level control signals for the MAC array.
+// Sequences ONE fully-connected layer through the MAC lanes.
+//
+// Work is split into "batches": batch b computes neurons
+//     b*NUM_MACS ... b*NUM_MACS + NUM_MACS-1     (one neuron per lane)
+// and needs  input_dim  cycles, one per input feature. There are
+//     num_batches = ceil(output_dim / NUM_MACS)
+// batches, and the last one may be partial (extra lanes are ignored).
+//
+// The datapath is a 3-stage pipeline, because the memories take one cycle to
+// return data:
+//
+//   stage 1 (READ)  : controller presents (batch, input_index) to the memories
+//   stage 2 (MAC)   : data arrives, every lane does acc += input * weight
+//   stage 3 (WRITE) : after a neuron's last input, results go to output memory
+//
+// The control flags (mac_enable, mac_first, write_enable...) are simply the
+// stage-1 conditions delayed by one or two clock cycles, so they line up with
+// the data they describe. Because of the pipeline, batch b+1 starts reading
+// while batch b is still finishing, so there are no idle cycles between
+// batches. Total busy time for one layer:
+//
+//     num_batches * input_dim  +  2   (2 = pipeline drain at the very end)
 
-module controller (
-    input  logic clk,
-    input  logic reset,
-    input  logic start,
+`timescale 1ns/1ps
 
-    output logic busy,
-    output logic done,
+module controller #(
+    parameter NUM_MACS    = 4,
+    parameter MAX_INPUTS  = 64,
+    parameter MAX_OUTPUTS = 32,
+    localparam IN_DIM_W   = $clog2(MAX_INPUTS + 1),
+    localparam IN_INDEX_W = $clog2(MAX_INPUTS),
+    localparam OUT_DIM_W  = $clog2(MAX_OUTPUTS + 1),
+    localparam MAX_BATCHES = (MAX_OUTPUTS + NUM_MACS - 1) / NUM_MACS,
+    localparam BATCH_W    = (MAX_BATCHES > 1) ? $clog2(MAX_BATCHES) : 1
+)(
+    input  logic                  clk,
+    input  logic                  reset,
+    input  logic                  start,
 
-    output logic mac_clear,
-    output logic mac_enable,
-    output logic output_write_enable,
+    // Layer configuration from the host. Captured when start is accepted, so
+    // the host may change these while the layer runs.
+    input  logic [IN_DIM_W-1:0]   config_input_dim,
+    input  logic [OUT_DIM_W-1:0]  config_output_dim,
+    input  logic [4:0]            config_output_shift,
+    input  logic                  config_relu,
 
-    output logic [2:0] input_index,  // 0-7 inputs
-    output logic [1:0] batch_index  // 0-3 batches of 4 neurons
+    // The captured configuration, used by the rest of the datapath
+    output logic [OUT_DIM_W-1:0]  output_dim,
+    output logic [4:0]            output_shift,
+    output logic                  relu_enable,
+
+    output logic                  busy,
+    output logic                  done,
+    output logic                  run_started,   // 1-cycle pulse: start accepted
+
+    // Stage 1: memory read addresses
+    output logic [IN_INDEX_W-1:0] read_input_index,
+    output logic [BATCH_W-1:0]    read_batch,
+
+    // Stage 2: MAC control (lines up with memory read data)
+    output logic                  mac_enable,
+    output logic                  mac_first,
+    output logic [BATCH_W-1:0]    mac_batch,
+
+    // Stage 3: write finished outputs
+    output logic                  write_enable,
+    output logic [BATCH_W-1:0]    write_batch
 );
 
-    // FSM states
-    typedef enum logic [2:0] {
-        IDLE,
-        CLEAR,
-        COMPUTE,
-        POST_PROCESS,
-        WRITE_OUTPUTS,
-        NEXT_BATCH,
-        DONE
+    typedef enum logic [1:0] {
+        IDLE,     // waiting for start
+        COMPUTE,  // stage 1 is issuing reads
+        DRAIN,    // no more reads; waiting for the last batch to be written
+        DONE      // results ready; wait for host to drop start
     } state_t;
 
-    state_t current_state;
-    state_t next_state;
+    state_t state;
 
+    logic [IN_DIM_W-1:0] input_dim;
+    logic [BATCH_W-1:0]  last_batch;
+    logic                mac_last;
 
-    // ------------------------------------------------------------
-    // State register
-    // Moves the FSM to next_state on each rising clock edge.
-    // Reset always returns the controller to IDLE.
-    // ------------------------------------------------------------
-    always_ff @(posedge clk) begin
-        if (reset)
-            current_state <= IDLE;
-        else
-            current_state <= next_state;
-    end
+    // ceil(output_dim / NUM_MACS) - 1, computed once per layer from the config.
+    function automatic logic [BATCH_W-1:0] last_batch_index(input logic [OUT_DIM_W-1:0] dim);
+        last_batch_index = BATCH_W'((32'(dim) + NUM_MACS - 1) / NUM_MACS - 1);
+    endfunction
 
+    logic issuing;
+    logic last_input;
+    assign issuing    = (state == COMPUTE);
+    assign last_input = (read_input_index == IN_INDEX_W'(input_dim - 1));
 
-    // ------------------------------------------------------------
-    // Counters
-    // input_index tracks which of the 8 inputs is being processed.
-    // batch_index tracks which group of 4 neurons is being processed.
-    // ------------------------------------------------------------
+    assign busy        = (state == COMPUTE) || (state == DRAIN);
+    assign done        = (state == DONE);
+    assign run_started = (state == IDLE) && start;
+
+    // --------------------------------------------------------------
+    // Stage 1: walk through (batch, input_index), one pair per cycle
+    // --------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (reset) begin
-            input_index <= 0;
-            batch_index <= 0;
-        end
+            state            <= IDLE;
+            read_input_index <= 0;
+            read_batch       <= 0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    if (start) begin
+                        input_dim        <= config_input_dim;
+                        output_dim       <= config_output_dim;
+                        output_shift     <= config_output_shift;
+                        relu_enable      <= config_relu;
+                        last_batch       <= last_batch_index(config_output_dim);
+                        read_input_index <= 0;
+                        read_batch       <= 0;
+                        state            <= COMPUTE;
+                    end
+                end
 
-        else begin
+                COMPUTE: begin
+                    if (!last_input) begin
+                        read_input_index <= read_input_index + 1;
+                    end else begin
+                        // Finished all inputs for this batch of neurons
+                        read_input_index <= 0;
+                        if (read_batch == last_batch)
+                            state <= DRAIN;
+                        else
+                            read_batch <= read_batch + 1;
+                    end
+                end
 
-            // Start each new batch from input 0
-            if (current_state == CLEAR)
-                input_index <= 0;
+                DRAIN: begin
+                    // Leave once the final batch has been written (stage 3)
+                    if (write_enable && write_batch == last_batch)
+                        state <= DONE;
+                end
 
-            // During COMPUTE, move through inputs 0 -> 7
-            else if (current_state == COMPUTE) begin
-                if (input_index < 7)
-                    input_index <= input_index + 1;
-            end
-
-            // After finishing a batch, move to the next group of 4 neurons
-            if (current_state == NEXT_BATCH) begin
-                if (batch_index < 3)
-                    batch_index <= batch_index + 1;
-            end
-
-            // New inference starts from batch 0
-            if (current_state == IDLE && start)
-                batch_index <= 0;
-
+                DONE: begin
+                    if (!start)
+                        state <= IDLE;
+                end
+            endcase
         end
     end
 
+    // --------------------------------------------------------------
+    // Stages 2 and 3: the same control information, delayed so it
+    // arrives together with the data it describes
+    // --------------------------------------------------------------
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            mac_enable   <= 0;
+            mac_first    <= 0;
+            mac_last     <= 0;
+            mac_batch    <= 0;
+            write_enable <= 0;
+            write_batch  <= 0;
+        end else begin
+            mac_enable   <= issuing;
+            mac_first    <= issuing && (read_input_index == 0);
+            mac_last     <= issuing && last_input;
+            mac_batch    <= read_batch;
 
-    // ------------------------------------------------------------
-    // Next-state logic
-    // Decides which state the controller should enter next.
-    // ------------------------------------------------------------
-    always_comb begin
-
-        // Default: stay in the current state
-        next_state = current_state;
-
-        case (current_state)
-
-            IDLE: begin
-                if (start)
-                    next_state = CLEAR;
-            end
-
-
-            // Clear MAC accumulators before starting a neuron batch
-            CLEAR: begin
-                next_state = COMPUTE;
-            end
-
-
-            // Process all 8 inputs for the current 4-neuron batch
-            COMPUTE: begin
-                if (input_index == 7)
-                    next_state = POST_PROCESS;
-            end
-
-
-            // Bias + ReLU + saturation happen here
-            POST_PROCESS: begin
-                next_state = WRITE_OUTPUTS;
-            end
-
-
-            // Store the four completed neuron outputs
-            WRITE_OUTPUTS: begin
-                next_state = NEXT_BATCH;
-            end
-
-
-            // If this was batch 3, all 16 neurons are complete
-            NEXT_BATCH: begin
-                if (batch_index == 3)
-                    next_state = DONE;
-                else
-                    next_state = CLEAR;
-            end
-
-
-            // Hold DONE until start is released
-            DONE: begin
-                if (!start)
-                    next_state = IDLE;
-            end
-
-
-            default: begin
-                next_state = IDLE;
-            end
-
-        endcase
-    end
-
-
-    // ------------------------------------------------------------
-    // Output/control logic
-    // These signals depend only on the current FSM state.
-    // ------------------------------------------------------------
-    always_comb begin
-
-        // Safe/default values
-        busy                = 0;
-        done                = 0;
-        mac_clear           = 0;
-        mac_enable          = 0;
-        output_write_enable = 0;
-
-        case (current_state)
-
-            IDLE: begin
-                // Waiting for START
-            end
-
-            CLEAR: begin
-                busy      = 1;
-                mac_clear = 1;
-            end
-
-            COMPUTE: begin
-                busy       = 1;
-                mac_enable = 1;
-            end
-
-            POST_PROCESS: begin
-                busy = 1;
-            end
-
-            WRITE_OUTPUTS: begin
-                busy = 1;
-                output_write_enable = 1;
-            end
-
-            NEXT_BATCH: begin
-                busy = 1;
-            end
-
-            DONE: begin
-                done = 1;
-            end
-
-            default: begin
-                // Keep defaults
-            end
-
-        endcase
+            // A neuron is finished one cycle after its last MAC
+            write_enable <= mac_enable && mac_last;
+            write_batch  <= mac_batch;
+        end
     end
 
 endmodule

@@ -1,41 +1,42 @@
-// Stores the 16 final INT8 neuron outputs.
-// The accelerator writes 4 neuron results in parallel after each MAC batch.
-// Results can later be read individually by the host/testbench.
+// Holds the finished INT8 outputs of one layer.
+//
+// After each batch, all NUM_MACS lanes write their neuron's result at once:
+//     lane k of batch b is neuron  b * NUM_MACS + k
+// Lanes whose neuron number is >= output_dim (the unused lanes of the last,
+// partial batch) are switched off with lane_valid.
+//
+// The host reads results back one at a time (combinational read, so the value
+// for output_read_address is available in the same cycle).
 
-module output_memory (
-    input logic clk,
+`timescale 1ns/1ps
 
-    // Write 4 outputs in parallel
-    input logic write_enable,
+module output_memory #(
+    parameter NUM_MACS    = 4,
+    parameter MAX_OUTPUTS = 32,
+    localparam INDEX_W    = $clog2(MAX_OUTPUTS)
+)(
+    input  logic clk,
 
-    input logic [3:0] write_address0,
-    input logic [3:0] write_address1,
-    input logic [3:0] write_address2,
-    input logic [3:0] write_address3,
+    input  logic                       write_enable,
+    input  logic [INDEX_W-1:0]         write_base,    // neuron number of lane 0
+    input  logic [NUM_MACS-1:0]        lane_valid,
+    input  logic [NUM_MACS-1:0][7:0]   write_data,
 
-    input logic signed [7:0] write_data0,
-    input logic signed [7:0] write_data1,
-    input logic signed [7:0] write_data2,
-    input logic signed [7:0] write_data3,
-
-    // Host/testbench reads one result at a time
-    input logic [3:0] read_address,
-    output logic signed [7:0] read_data
+    input  logic [INDEX_W-1:0]         read_address,
+    output logic signed [7:0]          read_data
 );
 
-logic signed [7:0] memory [0:15];
+    logic [7:0] memory [MAX_OUTPUTS];
 
-always_ff @(posedge clk) begin
-    if (write_enable) begin
-        memory[write_address0] <= write_data0;
-        memory[write_address1] <= write_data1;
-        memory[write_address2] <= write_data2;
-        memory[write_address3] <= write_data3;
+    always_ff @(posedge clk) begin
+        if (write_enable) begin
+            for (int lane = 0; lane < NUM_MACS; lane++) begin
+                if (lane_valid[lane])
+                    memory[write_base + INDEX_W'(lane)] <= write_data[lane];
+            end
+        end
     end
-end
 
-always_comb begin
-    read_data = memory[read_address];
-end
+    assign read_data = memory[read_address];
 
 endmodule

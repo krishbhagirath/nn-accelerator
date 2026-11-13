@@ -1,349 +1,252 @@
-// Top-level neural network accelerator.
-// Connects the controller, memories, 4-MAC array, post-processing, and output memory.
-// External write ports allow a host/testbench to load inputs, weights, and biases.
+// Generic INT8 fully-connected layer engine.
+//
+// The host (cocotb testbench or C++ runtime) runs a whole network by calling
+// this engine once per layer:
+//     load weights + biases + inputs -> set config -> start -> wait done -> read outputs
+// and then feeding those outputs in as the next layer's inputs.
+//
+// NUM_MACS (compile time) = how many neurons are computed in parallel.
+// input_dim / output_dim / shift / ReLU (run time) = which layer is computed.
+//
+//   input memory --input[i]--+--> lane 0: weight bank 0, bias bank 0, MAC, post-process --+
+//   (shared by all lanes)    +--> lane 1: weight bank 1, bias bank 1, MAC, post-process --+--> output memory
+//                            +--> ...                                                     |
+//                            +--> lane NUM_MACS-1 ----------------------------------------+
+//
+// Weight storage: neuron n lives in lane (n % NUM_MACS), row (n / NUM_MACS).
+// Each lane has its own weight bank holding its neurons' weights, one row of
+// MAX_INPUTS entries per neuron:
+//     bank address = row * MAX_INPUTS + input_index
+// During compute every lane reads the SAME address (row = current batch), so a
+// single address counter feeds all lanes, and each bank needs only one read port.
+// NUM_MACS must be a power of two (1, 2, 4, 8, ...) so % and / are just bit slices.
 
 `timescale 1ns/1ps
 
 module nn_accelerator_top #(
-    parameter OUTPUT_SHIFT = 9
+    parameter NUM_MACS    = 4,
+    parameter MAX_INPUTS  = 64,
+    parameter MAX_OUTPUTS = 32,
+
+    localparam IN_DIM_W    = $clog2(MAX_INPUTS + 1),   // holds 0..MAX_INPUTS
+    localparam IN_INDEX_W  = $clog2(MAX_INPUTS),       // holds 0..MAX_INPUTS-1
+    localparam OUT_DIM_W   = $clog2(MAX_OUTPUTS + 1),
+    localparam OUT_INDEX_W = $clog2(MAX_OUTPUTS),
+    localparam MAX_BATCHES = (MAX_OUTPUTS + NUM_MACS - 1) / NUM_MACS,
+    localparam BATCH_W     = (MAX_BATCHES > 1) ? $clog2(MAX_BATCHES) : 1,
+    localparam BANK_DEPTH  = MAX_BATCHES * MAX_INPUTS,
+    localparam BANK_ADDR_W = $clog2(BANK_DEPTH)
 )(
-    input logic clk,
-    input logic reset,
-    input logic start,
+    input  logic                    clk,
+    input  logic                    reset,
+    input  logic                    start,
 
-    // -----------------------------
-    // Host interface: load inputs
-    // -----------------------------
-    input logic input_write_enable,
-    input logic [2:0] input_write_address,
-    input logic signed [7:0] input_write_data,
+    // ---------------- layer configuration ----------------
+    input  logic [IN_DIM_W-1:0]     config_input_dim,
+    input  logic [OUT_DIM_W-1:0]    config_output_dim,
+    input  logic [4:0]              config_output_shift,
+    input  logic                    config_relu,
 
-    // -----------------------------
-    // Host interface: load weights
-    // -----------------------------
-    input logic weight_write_enable,
-    input logic [6:0] weight_write_address,
-    input logic signed [7:0] weight_write_data,
+    // ---------------- host: load input activations ----------------
+    input  logic                    input_write_enable,
+    input  logic [IN_INDEX_W-1:0]   input_write_address,
+    input  logic signed [7:0]       input_write_data,
 
-    // -----------------------------
-    // Host interface: load biases
-    // -----------------------------
-    input logic bias_write_enable,
-    input logic [3:0] bias_write_address,
-    input logic signed [31:0] bias_write_data,
+    // ---------------- host: load weights ----------------
+    // weight[neuron][input] = data
+    input  logic                    weight_write_enable,
+    input  logic [OUT_INDEX_W-1:0]  weight_write_neuron,
+    input  logic [IN_INDEX_W-1:0]   weight_write_input,
+    input  logic signed [7:0]       weight_write_data,
 
-    // -----------------------------
-    // Host interface: read outputs
-    // -----------------------------
-    input logic [3:0] output_read_address,
-    output logic signed [7:0] output_read_data,
+    // ---------------- host: load biases ----------------
+    input  logic                    bias_write_enable,
+    input  logic [OUT_INDEX_W-1:0]  bias_write_neuron,
+    input  logic signed [31:0]      bias_write_data,
 
-    // Accelerator status
-    output logic busy,
-    output logic done
+    // ---------------- host: read outputs ----------------
+    input  logic [OUT_INDEX_W-1:0]  output_read_address,
+    output logic signed [7:0]       output_read_data,
+
+    // ---------------- status + performance counters ----------------
+    output logic                    busy,
+    output logic                    done,
+    output logic [31:0]             cycle_count,
+    output logic [31:0]             mac_active_cycles,
+    output logic [31:0]             mac_operations
 );
-
-    // ============================================================
-    // Controller signals
-    // ============================================================
-
-    logic mac_clear;
-    logic mac_enable;
-    logic output_write_enable;
-
-    logic [2:0] input_index;   // Which input: 0-7
-    logic [1:0] batch_index;   // Which neuron batch: 0-3
-
-
-    // ============================================================
-    // Input memory → MAC array
-    // ============================================================
-
-    logic signed [7:0] input_value;
-
-
-    // ============================================================
-    // Weight memory → 4 MAC lanes
-    // ============================================================
-
-    logic [6:0] weight_address0;
-    logic [6:0] weight_address1;
-    logic [6:0] weight_address2;
-    logic [6:0] weight_address3;
-
-    logic signed [7:0] weight0;
-    logic signed [7:0] weight1;
-    logic signed [7:0] weight2;
-    logic signed [7:0] weight3;
-
-
-    // ============================================================
-    // MAC array outputs
-    // ============================================================
-
-    logic signed [31:0] acc0;
-    logic signed [31:0] acc1;
-    logic signed [31:0] acc2;
-    logic signed [31:0] acc3;
-
-
-    // ============================================================
-    // Bias memory
-    // ============================================================
-
-    logic [3:0] bias_address0;
-    logic [3:0] bias_address1;
-    logic [3:0] bias_address2;
-    logic [3:0] bias_address3;
-
-    logic signed [31:0] bias0;
-    logic signed [31:0] bias1;
-    logic signed [31:0] bias2;
-    logic signed [31:0] bias3;
-
-
-    // ============================================================
-    // Post-processing outputs
-    // ============================================================
-
-    logic signed [7:0] out0;
-    logic signed [7:0] out1;
-    logic signed [7:0] out2;
-    logic signed [7:0] out3;
-
-
-    // ============================================================
-    // Output memory addresses
-    // ============================================================
-
-    logic [3:0] output_address0;
-    logic [3:0] output_address1;
-    logic [3:0] output_address2;
-    logic [3:0] output_address3;
-
-
-    // ============================================================
-    // Address generation
-    //
-    // Each batch contains 4 neurons.
-    //
-    // batch 0 → neurons 0-3
-    // batch 1 → neurons 4-7
-    // batch 2 → neurons 8-11
-    // batch 3 → neurons 12-15
-    // ============================================================
-
-    always_comb begin
-
-        // Each neuron has 8 weights.
-        //
-        // Example:
-        // batch 1 = neurons 4,5,6,7
-        //
-        // neuron 4 weights begin at 4*8 = address 32
-        // neuron 5 weights begin at 5*8 = address 40
-        // etc.
-
-        weight_address0 = {batch_index, 5'b00000}
-                        + input_index;
-
-        weight_address1 = {batch_index, 5'b00000}
-                        + 7'd8
-                        + input_index;
-
-        weight_address2 = {batch_index, 5'b00000}
-                        + 7'd16
-                        + input_index;
-
-        weight_address3 = {batch_index, 5'b00000}
-                        + 7'd24
-                        + input_index;
-
-
-        // One bias per neuron
-        bias_address0 = {batch_index, 2'b00};
-        bias_address1 = {batch_index, 2'b00} + 4'd1;
-        bias_address2 = {batch_index, 2'b00} + 4'd2;
-        bias_address3 = {batch_index, 2'b00} + 4'd3;
-
-
-        // Finished outputs go into the same neuron-number locations
-        output_address0 = bias_address0;
-        output_address1 = bias_address1;
-        output_address2 = bias_address2;
-        output_address3 = bias_address3;
-
-    end
-
 
     // ============================================================
     // Controller
     // ============================================================
 
-    controller controller_inst (
+    logic [OUT_DIM_W-1:0]  output_dim;
+    logic [4:0]            output_shift;
+    logic                  relu_enable;
+    logic                  run_started;
+    logic [IN_INDEX_W-1:0] read_input_index;
+    logic [BATCH_W-1:0]    read_batch;
+    logic                  mac_enable;
+    logic                  mac_first;
+    logic [BATCH_W-1:0]    mac_batch;
+    logic                  write_enable;
+    logic [BATCH_W-1:0]    write_batch;
+
+    controller #(
+        .NUM_MACS(NUM_MACS),
+        .MAX_INPUTS(MAX_INPUTS),
+        .MAX_OUTPUTS(MAX_OUTPUTS)
+    ) controller_inst (
         .clk(clk),
         .reset(reset),
         .start(start),
-
+        .config_input_dim(config_input_dim),
+        .config_output_dim(config_output_dim),
+        .config_output_shift(config_output_shift),
+        .config_relu(config_relu),
+        .output_dim(output_dim),
+        .output_shift(output_shift),
+        .relu_enable(relu_enable),
         .busy(busy),
         .done(done),
-
-        .mac_clear(mac_clear),
+        .run_started(run_started),
+        .read_input_index(read_input_index),
+        .read_batch(read_batch),
         .mac_enable(mac_enable),
-        .output_write_enable(output_write_enable),
-
-        .input_index(input_index),
-        .batch_index(batch_index)
+        .mac_first(mac_first),
+        .mac_batch(mac_batch),
+        .write_enable(write_enable),
+        .write_batch(write_batch)
     );
 
-
     // ============================================================
-    // Input Memory
+    // Input memory: one INT8 value per input feature, shared by all lanes
     // ============================================================
 
-    input_memory input_memory_inst (
+    logic [7:0] input_value;
+
+    sync_ram #(.WIDTH(8), .DEPTH(MAX_INPUTS)) input_memory (
         .clk(clk),
-
         .write_enable(input_write_enable),
         .write_address(input_write_address),
         .write_data(input_write_data),
-
-        // Controller chooses which input is currently needed
-        .read_address(input_index),
+        .read_address(read_input_index),
         .read_data(input_value)
     );
 
-
     // ============================================================
-    // Weight Memory
+    // Where does a host-written neuron live?  lane = n % NUM_MACS, row = n / NUM_MACS
     // ============================================================
 
-    weight_memory weight_memory_inst (
-        .clk(clk),
+    function automatic logic [31:0] lane_of(input logic [OUT_INDEX_W-1:0] neuron);
+        lane_of = 32'(neuron) % NUM_MACS;
+    endfunction
 
-        .write_enable(weight_write_enable),
-        .write_address(weight_write_address),
-        .write_data(weight_write_data),
+    function automatic logic [BATCH_W-1:0] row_of(input logic [OUT_INDEX_W-1:0] neuron);
+        row_of = BATCH_W'(32'(neuron) / NUM_MACS);
+    endfunction
 
-        .read_address0(weight_address0),
-        .read_address1(weight_address1),
-        .read_address2(weight_address2),
-        .read_address3(weight_address3),
-
-        .read_data0(weight0),
-        .read_data1(weight1),
-        .read_data2(weight2),
-        .read_data3(weight3)
+    // Weight bank address = row * MAX_INPUTS + input_index
+    function automatic logic [BANK_ADDR_W-1:0] bank_address(
+        input logic [BATCH_W-1:0]    row,
+        input logic [IN_INDEX_W-1:0] input_index
     );
-
+        bank_address = BANK_ADDR_W'(32'(row) * MAX_INPUTS + 32'(input_index));
+    endfunction
 
     // ============================================================
-    // 4-MAC Array
+    // MAC lanes (one per NUM_MACS)
     // ============================================================
 
-    mac_array mac_array_inst (
+    logic [NUM_MACS-1:0][7:0] lane_results;
+    logic [NUM_MACS-1:0]      mac_lane_valid;    // lane holds a real neuron in stage 2
+    logic [NUM_MACS-1:0]      write_lane_valid;  // lane holds a real neuron in stage 3
+
+    genvar lane;
+    generate
+        for (lane = 0; lane < NUM_MACS; lane++) begin : lanes
+
+            logic [7:0]         weight_value;
+            logic [31:0]        bias_value;
+            logic signed [31:0] accumulator;
+
+            // This lane's slice of the weights
+            sync_ram #(.WIDTH(8), .DEPTH(BANK_DEPTH)) weight_bank (
+                .clk(clk),
+                .write_enable(weight_write_enable && lane_of(weight_write_neuron) == lane),
+                .write_address(bank_address(row_of(weight_write_neuron), weight_write_input)),
+                .write_data(weight_write_data),
+                .read_address(bank_address(read_batch, read_input_index)),
+                .read_data(weight_value)
+            );
+
+            // This lane's biases: one per row (batch)
+            sync_ram #(.WIDTH(32), .DEPTH(MAX_BATCHES)) bias_bank (
+                .clk(clk),
+                .write_enable(bias_write_enable && lane_of(bias_write_neuron) == lane),
+                .write_address(row_of(bias_write_neuron)),
+                .write_data(bias_write_data),
+                .read_address(read_batch),
+                .read_data(bias_value)
+            );
+
+            mac_unit mac (
+                .clk(clk),
+                .reset(reset),
+                .enable(mac_enable),
+                .first(mac_first),
+                .input_value(input_value),
+                .weight(weight_value),
+                .bias(bias_value),
+                .accumulator(accumulator)
+            );
+
+            post_process post (
+                .accumulator(accumulator),
+                .output_shift(output_shift),
+                .relu_enable(relu_enable),
+                .result(lane_results[lane])
+            );
+
+            // Neuron number = batch * NUM_MACS + lane. In the last batch some
+            // lanes may be past output_dim; they compute garbage that is never
+            // written and never counted.
+            assign mac_lane_valid[lane]   = (32'(mac_batch)   * NUM_MACS + lane) < 32'(output_dim);
+            assign write_lane_valid[lane] = (32'(write_batch) * NUM_MACS + lane) < 32'(output_dim);
+        end
+    endgenerate
+
+    // ============================================================
+    // Output memory
+    // ============================================================
+
+    output_memory #(
+        .NUM_MACS(NUM_MACS),
+        .MAX_OUTPUTS(MAX_OUTPUTS)
+    ) output_memory_inst (
         .clk(clk),
-        .reset(reset),
-
-        .clear(mac_clear),
-        .enable(mac_enable),
-
-        // Same input is broadcast to all four MACs
-        .input_value(input_value),
-
-        // Each MAC gets its own neuron's weight
-        .weight0(weight0),
-        .weight1(weight1),
-        .weight2(weight2),
-        .weight3(weight3),
-
-        .acc0(acc0),
-        .acc1(acc1),
-        .acc2(acc2),
-        .acc3(acc3)
-    );
-
-
-    // ============================================================
-    // Bias Memory
-    // ============================================================
-
-    bias_memory bias_memory_inst (
-        .clk(clk),
-
-        .write_enable(bias_write_enable),
-        .write_address(bias_write_address),
-        .write_data(bias_write_data),
-
-        .read_address0(bias_address0),
-        .read_address1(bias_address1),
-        .read_address2(bias_address2),
-        .read_address3(bias_address3),
-
-        .read_data0(bias0),
-        .read_data1(bias1),
-        .read_data2(bias2),
-        .read_data3(bias3)
-    );
-
-
-    // ============================================================
-    // Post Processing
-    //
-    // MAC result
-    //    ↓
-    // + bias
-    //    ↓
-    // scaling
-    //    ↓
-    // ReLU
-    //    ↓
-    // clamp to 0-127
-    // ============================================================
-
-    post_process #(
-        .OUTPUT_SHIFT(OUTPUT_SHIFT)
-    ) post_process_inst (
-        .acc0(acc0),
-        .acc1(acc1),
-        .acc2(acc2),
-        .acc3(acc3),
-
-        .bias0(bias0),
-        .bias1(bias1),
-        .bias2(bias2),
-        .bias3(bias3),
-
-        .out0(out0),
-        .out1(out1),
-        .out2(out2),
-        .out3(out3)
-    );
-
-
-    // ============================================================
-    // Output Memory
-    // ============================================================
-
-    output_memory output_memory_inst (
-        .clk(clk),
-
-        // Controller enables this after a batch finishes
-        .write_enable(output_write_enable),
-
-        .write_address0(output_address0),
-        .write_address1(output_address1),
-        .write_address2(output_address2),
-        .write_address3(output_address3),
-
-        .write_data0(out0),
-        .write_data1(out1),
-        .write_data2(out2),
-        .write_data3(out3),
-
-        // Host/testbench can inspect results after DONE
+        .write_enable(write_enable),
+        .write_base(OUT_INDEX_W'(32'(write_batch) * NUM_MACS)),
+        .lane_valid(write_lane_valid),
+        .write_data(lane_results),
         .read_address(output_read_address),
         .read_data(output_read_data)
+    );
+
+    // ============================================================
+    // Performance counters
+    // ============================================================
+
+    perf_counters #(.NUM_MACS(NUM_MACS)) counters (
+        .clk(clk),
+        .reset(reset),
+        .run_started(run_started),
+        .busy(busy),
+        .mac_enable(mac_enable),
+        .mac_lane_valid(mac_lane_valid),
+        .cycle_count(cycle_count),
+        .mac_active_cycles(mac_active_cycles),
+        .mac_operations(mac_operations)
     );
 
 endmodule

@@ -1,0 +1,10 @@
+{
+    "model": "tiny",
+    "dataset": "synthetic",
+    "architecture": "8 -> 16 -> 2",
+    "num_parameters": 178,
+    "train_samples": 1600,
+    "test_samples": 400,
+    "torch_float_test_accuracy": 0.9975,
+    "final_train_loss": 0.03916681930422783
+}

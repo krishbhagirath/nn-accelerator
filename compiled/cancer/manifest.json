@@ -1,0 +1,25 @@
+{
+    "model": "cancer",
+    "input_dim": 30,
+    "input_scale": 12.054270794922209,
+    "num_layers": 2,
+    "num_test_samples": 114,
+    "layers": [
+        {
+            "input_dim": 30,
+            "output_dim": 16,
+            "relu": true,
+            "output_shift": 9,
+            "weights_file": "layer_0_weights.txt",
+            "biases_file": "layer_0_biases.txt"
+        },
+        {
+            "input_dim": 16,
+            "output_dim": 2,
+            "relu": false,
+            "output_shift": 8,
+            "weights_file": "layer_1_weights.txt",
+            "biases_file": "layer_1_biases.txt"
+        }
+    ]
+}

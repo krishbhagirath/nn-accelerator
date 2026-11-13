@@ -1,0 +1,35 @@
+# Continuous integration: Python tests, Verilator lint, cocotb regression.
+# Synthesis is not run here (it is slow and needs the ECP5 toolchain).
+
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install simulators
+        run: sudo apt-get update && sudo apt-get install -y iverilog verilator
+
+      - name: Install Python packages
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Train and compile models
+        run: |
+          python run_pipeline.py train
+          python run_pipeline.py compile
+
+      - name: Verilator lint (NUM_MACS = 1, 2, 4, 8)
+        run: python run_pipeline.py lint
+
+      - name: Python unit tests + cocotb regression (NUM_MACS = 1, 2, 4, 8)
+        run: python run_pipeline.py test

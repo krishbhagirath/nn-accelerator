@@ -1,0 +1,5 @@
+num_macs,yosys_total_cells,lut4,carry_cells_ccu2c,flip_flops,dsp_mult18x18,block_ram_dp16kd,lutram_dpr16x4,pnr_logic_cells_used,pnr_logic_cells_available,fmax_mhz,critical_path_ns,critical_path_from,critical_path_to
+1,1097,512,110,249,1,1,28,952,83640,61.05,16.38,lanes[0].weight_bank.read_data_LUT4_Z_2,lanes[0].mac.accumulator_TRELLIS_FF_Q_14
+2,2236,1098,155,566,2,2,24,1622,83640,60.03,16.66,lanes[1].weight_bank.read_data_LUT4_Z_2,lanes[1].mac.accumulator_TRELLIS_FF_Q_31
+4,3584,1859,249,693,4,4,40,2703,83640,60.79,16.45,lanes[3].weight_bank.read_data_LUT4_Z_7,lanes[3].mac.accumulator_TRELLIS_FF_Q_31
+8,6434,3445,441,952,8,8,72,4945,83640,57.11,17.51,lanes[5].weight_bank.read_data_LUT4_Z_7,lanes[5].mac.accumulator_TRELLIS_FF_Q_31

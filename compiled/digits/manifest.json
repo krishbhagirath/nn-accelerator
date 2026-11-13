@@ -1,0 +1,25 @@
+{
+    "model": "digits",
+    "input_dim": 64,
+    "input_scale": 127.0,
+    "num_layers": 2,
+    "num_test_samples": 360,
+    "layers": [
+        {
+            "input_dim": 64,
+            "output_dim": 16,
+            "relu": true,
+            "output_shift": 10,
+            "weights_file": "layer_0_weights.txt",
+            "biases_file": "layer_0_biases.txt"
+        },
+        {
+            "input_dim": 16,
+            "output_dim": 10,
+            "relu": false,
+            "output_shift": 8,
+            "weights_file": "layer_1_weights.txt",
+            "biases_file": "layer_1_biases.txt"
+        }
+    ]
+}

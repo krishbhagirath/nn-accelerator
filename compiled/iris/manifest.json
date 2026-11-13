@@ -1,0 +1,25 @@
+{
+    "model": "iris",
+    "input_dim": 4,
+    "input_scale": 41.85200734749887,
+    "num_layers": 2,
+    "num_test_samples": 30,
+    "layers": [
+        {
+            "input_dim": 4,
+            "output_dim": 8,
+            "relu": true,
+            "output_shift": 8,
+            "weights_file": "layer_0_weights.txt",
+            "biases_file": "layer_0_biases.txt"
+        },
+        {
+            "input_dim": 8,
+            "output_dim": 3,
+            "relu": false,
+            "output_shift": 6,
+            "weights_file": "layer_1_weights.txt",
+            "biases_file": "layer_1_biases.txt"
+        }
+    ]
+}

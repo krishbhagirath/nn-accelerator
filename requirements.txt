@@ -1,0 +1,17 @@
+# Python packages (tested with Python 3.13 on Windows).
+# Install: pip install -r requirements.txt
+#
+# Non-Python tools (not installed by pip):
+#   Icarus Verilog 12+   RTL simulation for cocotb
+#   Verilator 5          lint + C++ runtime (needs g++ and make)
+#   Yosys + nextpnr-ecp5 + prjtrellis   synthesis / place & route (optional)
+# On Windows all of these come from MSYS2 (see README).
+
+numpy>=2.0
+torch>=2.4
+onnx>=1.16
+onnxscript>=0.1    # used by torch.onnx.export
+onnxruntime>=1.18
+scikit-learn>=1.4
+cocotb>=2.0
+pytest>=8.0

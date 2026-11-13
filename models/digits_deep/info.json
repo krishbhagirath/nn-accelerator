@@ -1,0 +1,10 @@
+{
+    "model": "digits_deep",
+    "dataset": "digits",
+    "architecture": "64 -> 32 -> 16 -> 10",
+    "num_parameters": 2778,
+    "train_samples": 1437,
+    "test_samples": 360,
+    "torch_float_test_accuracy": 0.9611111111111111,
+    "final_train_loss": 0.0018461990403011441
+}
