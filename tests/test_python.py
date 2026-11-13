@@ -129,7 +129,7 @@ def test_compiled_model_is_consistent(model):
     """expected_outputs.txt really is the golden model's output, and fits hardware limits."""
     manifest, layers, inputs, expected, labels = golden.load_compiled_model(
         PROJECT_ROOT / "compiled" / model)
-    assert manifest["num_layers"] == len(layers)
+    assert manifest["num_layers"] == len(layers) <= compile_onnx.MAX_LAYERS
     assert len(inputs) == len(expected) == len(labels) == manifest["num_test_samples"]
     assert np.array_equal(golden.run_model(inputs, layers)[-1], expected)
     for i, layer in enumerate(layers):

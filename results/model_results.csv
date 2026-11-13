@@ -1,6 +1,6 @@
-model,dataset,architecture,parameters,samples,float_accuracy,quantized_accuracy,rtl_accuracy,bit_exact_rate,integer_mismatches,compute_cycles,host_cycles_per_sample,weight_load_cycles
-tiny,synthetic,8 -> 16 -> 2,178,400,0.9975,0.9975,0.9975,1.0000,0,52,100,178
-iris,iris,4 -> 8 -> 3,67,30,1.0000,1.0000,1.0000,1.0000,0,20,49,67
-cancer,breast_cancer,30 -> 16 -> 2,530,114,0.9649,0.9649,0.9649,1.0000,0,140,210,530
-digits,digits,64 -> 16 -> 10,1210,360,0.9667,0.9667,0.9667,1.0000,0,308,420,1210
-digits_deep,digits,64 -> 32 -> 16 -> 10,2778,360,0.9611,0.9611,0.9611,1.0000,0,694,873,2778
+model,dataset,architecture,parameters,samples,float_accuracy,quantized_accuracy,rtl_accuracy,bit_exact_rate,integer_mismatches,compute_cycles,host_cycles_per_sample,layer_at_a_time_host_cycles,host_speedup,weight_load_cycles
+tiny,synthetic,8 -> 16 -> 2,178,400,0.9975,0.9975,0.9975,1.0000,0,52,65,280,4.3077,180
+iris,iris,4 -> 8 -> 3,67,30,1.0000,1.0000,1.0000,1.0000,0,20,30,118,3.9333,69
+cancer,breast_cancer,30 -> 16 -> 2,530,114,0.9649,0.9649,0.9649,1.0000,0,140,175,742,4.2400,532
+digits,digits,64 -> 16 -> 10,1210,360,0.9667,0.9667,0.9667,1.0000,0,308,385,1632,4.2390,1212
+digits_deep,digits,64 -> 32 -> 16 -> 10,2778,360,0.9611,0.9611,0.9611,1.0000,0,694,771,3654,4.7393,2781

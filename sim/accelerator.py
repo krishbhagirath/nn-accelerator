@@ -1,8 +1,12 @@
 # Host-side driver for the accelerator, used by every cocotb test.
 #
-# This plays the role a real software runtime would: write memories, set the
-# layer configuration, pulse start, wait for done, read results back.
-# The C++ runtime (runtime/main.cpp) does exactly the same steps.
+# This plays the role a real software runtime would. The C++ runtime
+# (runtime/main.cpp) does exactly the same steps:
+#
+#   once per model:      load_network(layers)   layer table + every layer's weights/biases
+#   once per inference:  load_inputs(x) -> run(num_layers) -> read_outputs(n)
+#
+# A single layer is just a 1-layer network (load_layer / run_layer below).
 #
 # Every host action takes whole clock cycles, and we count them, so the
 # benchmark can report load / compute / read-back cycles separately.
@@ -28,6 +32,7 @@ class Accelerator:
         self.num_macs = int(dut.NUM_MACS.value)
         self.max_inputs = int(dut.MAX_INPUTS.value)
         self.max_outputs = int(dut.MAX_OUTPUTS.value)
+        self.max_layers = int(dut.MAX_LAYERS.value)
 
     def now_cycles(self):
         return int(get_sim_time("ns")) // CLOCK_PERIOD_NS
@@ -41,40 +46,53 @@ class Accelerator:
         dut = self.dut
         dut.reset.value = 1
         dut.start.value = 0
-        dut.input_write_enable.value = 0
+        dut.config_num_layers.value = 1
+        dut.layer_write_enable.value = 0
         dut.weight_write_enable.value = 0
         dut.bias_write_enable.value = 0
+        dut.input_write_enable.value = 0
         dut.output_read_address.value = 0
-        dut.config_input_dim.value = 1
-        dut.config_output_dim.value = 1
-        dut.config_output_shift.value = 0
-        dut.config_relu.value = 0
         for _ in range(cycles):
             await RisingEdge(dut.clk)
         dut.reset.value = 0
         await RisingEdge(dut.clk)
 
     # ------------------------------------------------------------
-    # Loading memories: one value per clock cycle
+    # Loading a model: one value per clock cycle
     # ------------------------------------------------------------
 
-    async def load_weights(self, weights):
-        """weights[neuron][input]. Returns the number of cycles used."""
+    async def write_layer_config(self, index, layer):
+        """One layer table entry: dims, shift, ReLU."""
+        dut = self.dut
+        dut.layer_write_enable.value = 1
+        dut.layer_write_index.value = index
+        dut.layer_write_input_dim.value = layer["input_dim"]
+        dut.layer_write_output_dim.value = layer["output_dim"]
+        dut.layer_write_output_shift.value = layer["output_shift"]
+        dut.layer_write_relu.value = int(bool(layer["relu"]))
+        await RisingEdge(dut.clk)
+        dut.layer_write_enable.value = 0
+        return 1
+
+    async def load_weights(self, index, weights):
+        """weights[neuron][input] for layer `index`. Returns the cycles used."""
         dut = self.dut
         cycles = 0
+        dut.weight_write_layer.value = index
         for neuron, row in enumerate(weights):
-            for index, value in enumerate(row):
+            for i, value in enumerate(row):
                 dut.weight_write_enable.value = 1
                 dut.weight_write_neuron.value = neuron
-                dut.weight_write_input.value = index
+                dut.weight_write_input.value = i
                 dut.weight_write_data.value = int(value)
                 await RisingEdge(dut.clk)
                 cycles += 1
         dut.weight_write_enable.value = 0
         return cycles
 
-    async def load_biases(self, biases):
+    async def load_biases(self, index, biases):
         dut = self.dut
+        dut.bias_write_layer.value = index
         for neuron, value in enumerate(biases):
             dut.bias_write_enable.value = 1
             dut.bias_write_neuron.value = neuron
@@ -82,6 +100,20 @@ class Accelerator:
             await RisingEdge(dut.clk)
         dut.bias_write_enable.value = 0
         return len(biases)
+
+    async def load_layer(self, layer, index=0):
+        """Put one layer (config + weights + biases) into table slot `index`."""
+        return (await self.write_layer_config(index, layer)
+                + await self.load_weights(index, layer["weights"])
+                + await self.load_biases(index, layer["biases"]))
+
+    async def load_network(self, layers):
+        """Load every layer of a model. Done once; the weights then stay on chip."""
+        assert 1 <= len(layers) <= self.max_layers
+        cycles = 0
+        for index, layer in enumerate(layers):
+            cycles += await self.load_layer(layer, index)
+        return cycles
 
     async def load_inputs(self, inputs):
         dut = self.dut
@@ -93,25 +125,18 @@ class Accelerator:
         dut.input_write_enable.value = 0
         return len(inputs)
 
-    async def load_layer(self, layer):
-        """Load one compiled layer's weights and biases."""
-        return await self.load_weights(layer["weights"]) + await self.load_biases(layer["biases"])
-
     # ------------------------------------------------------------
-    # Running one layer
+    # Running
     # ------------------------------------------------------------
 
-    async def run(self, input_dim, output_dim, shift, relu):
-        """Configure, start, wait for done, release start.
+    async def run(self, num_layers):
+        """Start the network, wait for done, release start.
 
         Returns the hardware counters plus host-observed latency:
           start_to_done = clock edges from asserting start until done is seen.
         """
         dut = self.dut
-        dut.config_input_dim.value = input_dim
-        dut.config_output_dim.value = output_dim
-        dut.config_output_shift.value = shift
-        dut.config_relu.value = int(bool(relu))
+        dut.config_num_layers.value = num_layers
         dut.start.value = 1
         started_at = self.now_cycles()
 
@@ -145,13 +170,16 @@ class Accelerator:
             await RisingEdge(dut.clk)
         return results
 
-    async def run_layer(self, layer, inputs):
-        """Load inputs, run one already-loaded layer, read its outputs."""
+    async def infer(self, layers, inputs):
+        """One inference of an already-loaded network: inputs in, final outputs out."""
         await self.load_inputs(inputs)
-        counters = await self.run(layer["input_dim"], layer["output_dim"],
-                                  layer["output_shift"], layer["relu"])
-        outputs = await self.read_outputs(layer["output_dim"])
+        counters = await self.run(len(layers))
+        outputs = await self.read_outputs(layers[-1]["output_dim"])
         return outputs, counters
+
+    async def run_layer(self, layer, inputs):
+        """One already-loaded layer (in slot 0) as a 1-layer network."""
+        return await self.infer([layer], inputs)
 
 
 def expected_layer_counters(input_dim, output_dim, num_macs):
@@ -163,3 +191,13 @@ def expected_layer_counters(input_dim, output_dim, num_macs):
         "mac_operations": input_dim * output_dim,
         "start_to_done": batches * input_dim + 3,
     }
+
+
+def expected_network_counters(layers, num_macs):
+    """A network is its layers back to back: every counter is a plain sum,
+    and start_to_done is 1 more than cycle_count (the cycle that accepts start)."""
+    per_layer = [expected_layer_counters(l["input_dim"], l["output_dim"], num_macs) for l in layers]
+    total = {key: sum(c[key] for c in per_layer)
+             for key in ["cycle_count", "mac_active_cycles", "mac_operations"]}
+    total["start_to_done"] = total["cycle_count"] + 1
+    return total
