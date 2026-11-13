@@ -121,7 +121,7 @@ module controller #(
     logic last_input;
     logic layer_finished;
     assign issuing        = (state == COMPUTE);
-    assign last_input     = (read_input_index == IN_INDEX_W'(input_dim - 1));
+    assign last_input     = (read_input_index == IN_INDEX_W'(input_dim - 1'b1));
     assign layer_finished = (state == DRAIN) && write_enable && (write_batch == last_batch);
 
     assign busy        = (state == COMPUTE) || (state == DRAIN);
@@ -148,7 +148,7 @@ module controller #(
             case (state)
                 IDLE: begin
                     if (start)
-                        last_layer <= LAYER_W'(config_num_layers - 1);
+                        last_layer <= LAYER_W'(config_num_layers - 1'b1);
                     // (moving to COMPUTE is handled by begin_layer below)
                 end
 
