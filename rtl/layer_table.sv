@@ -13,9 +13,10 @@ module layer_table #(
     parameter MAX_LAYERS  = 4,
     parameter MAX_INPUTS  = 64,
     parameter MAX_OUTPUTS = 32,
-    localparam LAYER_W    = (MAX_LAYERS > 1) ? $clog2(MAX_LAYERS) : 1,
-    localparam IN_DIM_W   = $clog2(MAX_INPUTS + 1),
-    localparam OUT_DIM_W  = $clog2(MAX_OUTPUTS + 1)
+    // Derived sizes: don't override. (parameter, not localparam: Quartus rejects localparam here.)
+    parameter  LAYER_W    = (MAX_LAYERS > 1) ? $clog2(MAX_LAYERS) : 1,
+    parameter  IN_DIM_W   = $clog2(MAX_INPUTS + 1),
+    parameter  OUT_DIM_W  = $clog2(MAX_OUTPUTS + 1)
 )(
     input  logic                 clk,
 

@@ -227,6 +227,7 @@ python run_pipeline.py lint        # Verilator -Wall, NUM_MACS = 1/2/4/8
 python run_pipeline.py test        # pytest + cocotb regression for 1/2/4/8 MACs
 python run_pipeline.py benchmark   # all models x all MAC counts + original design -> results/
 python run_pipeline.py synth       # Yosys + nextpnr for 1/2/4/8 MACs -> results/
+python run_pipeline.py quartus     # Intel Quartus (Cyclone IV E) for 1/2/4/8 MACs -> results/
 python run_pipeline.py runtime --model digits --num-macs 4   # C++ Verilator runtime
 python run_pipeline.py demo    --model digits --num-macs 4   # one model, readable output
 python run_pipeline.py all
@@ -245,6 +246,9 @@ also works around three Windows issues:
 - MSYS2 GCC 16.2 fails to link `std::string` at `-Os`, so the runtime builds with `-O2`.
 
 On Linux: `apt install iverilog verilator yosys nextpnr-ecp5`.
+
+For the Intel build, install the free Quartus Prime Lite (with Cyclone IV support).
+`run_pipeline.py` finds `quartus_sh` on PATH or in `C:\intelFPGA_lite`.
 
 ## 9. Supported models
 
@@ -324,6 +328,12 @@ two reasons:
 
 ## 12. Synthesis results
 
+The RTL is plain SystemVerilog with no vendor-specific blocks, so the same files
+build for both a Lattice ECP5 (open-source tools) and an Intel/Altera FPGA (Quartus).
+Memories, multipliers and the rest are inferred by each tool.
+
+### Lattice ECP5
+
 **Flow:**
 - Lattice ECP5 LFE5U-85F, speed grade 6, using Yosys `synth_ecp5` then
   `nextpnr-ecp5`.
@@ -357,6 +367,26 @@ two reasons:
   - Every model is in `results/summary.md`.
 - **Not available:** ASIC area and power. No standard-cell library was used.
 
+### Intel Cyclone IV E (Quartus)
+
+**Flow:**
+- Cyclone IV E EP4CE115F29C7 (the chip on the Terasic DE2-115 board), Quartus
+  Prime Lite 22.1, `synth/quartus.tcl`.
+- Out of context like the ECP5 build: every port is a virtual pin.
+- Constrained to the board's 50 MHz clock. Fmax is from the slowest timing model
+  (1200 mV, 85 °C).
+
+| MACs | Logic elements | Registers | Memory bits | 9-bit multipliers | Fmax |
+|---|---|---|---|---|---|
+| 1 | 2659 | 1297 | 69,632 | 1 | 75.13 MHz |
+| 2 | 2864 | 1325 | 69,632 | 2 | 76.14 MHz |
+| 4 | 3311 | 1385 | 69,632 | 4 | 67.71 MHz |
+| 8 | 4202 | 1509 | 69,632 | 8 | 69.86 MHz |
+
+- Every configuration meets the 50 MHz board clock, and uses under 4% of the chip.
+- The weight memories map to M9K block RAM: 69,632 bits = 4 layers × 32 neurons ×
+  64 inputs × 8 bits, plus the biases.
+
 ## 13. Limitations
 
 - **Fully-connected layers only** (Gemm + ReLU). No convolution, pooling or
@@ -375,12 +405,13 @@ two reasons:
 - **Interface:** the host interface is direct ports, not a standard bus
   (Avalon/AXI/Wishbone).
 - **Not run on a physical FPGA yet.** All numbers are RTL simulation or
-  post-route estimates.
+  post-route estimates. It builds for an Intel Cyclone IV E (DE2-115), but there
+  is no board top level (pins, clock, loading weights) yet.
 
 ## 14. Future work
 
-- Run on a DE10 board (Intel FPGA): a thin board wrapper with a bus interface
-  (Avalon-MM) and measured on-board latency.
+- Run on a DE2-115 board: a board top level that loads a model from on-chip memory,
+  runs the test samples and shows the result on the LEDs / 7-segment displays.
 - Register the multiplier output (a 4-stage pipeline) to raise Fmax.
 - Round-to-nearest requantization and per-channel weight scales.
 - A wider host write port to cut input-loading time.

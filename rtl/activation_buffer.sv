@@ -32,9 +32,10 @@
 module activation_buffer #(
     parameter NUM_MACS = 4,
     parameter DEPTH    = 64,
-    localparam INDEX_W = $clog2(DEPTH),
-    localparam NUM_ROWS = DEPTH / NUM_MACS,
-    localparam ROW_W   = (NUM_ROWS > 1) ? $clog2(NUM_ROWS) : 1
+    // Derived sizes: don't override. (parameter, not localparam: Quartus rejects localparam here.)
+    parameter  INDEX_W = $clog2(DEPTH),
+    parameter  NUM_ROWS = DEPTH / NUM_MACS,
+    parameter  ROW_W   = (NUM_ROWS > 1) ? $clog2(NUM_ROWS) : 1
 )(
     input  logic                     clk,
 

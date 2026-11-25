@@ -48,13 +48,14 @@ module controller #(
     parameter MAX_INPUTS  = 64,
     parameter MAX_OUTPUTS = 32,
     parameter MAX_LAYERS  = 4,
-    localparam IN_DIM_W    = $clog2(MAX_INPUTS + 1),
-    localparam IN_INDEX_W  = $clog2(MAX_INPUTS),
-    localparam OUT_DIM_W   = $clog2(MAX_OUTPUTS + 1),
-    localparam MAX_BATCHES = (MAX_OUTPUTS + NUM_MACS - 1) / NUM_MACS,
-    localparam BATCH_W     = (MAX_BATCHES > 1) ? $clog2(MAX_BATCHES) : 1,
-    localparam LAYER_W     = (MAX_LAYERS > 1) ? $clog2(MAX_LAYERS) : 1,
-    localparam NUM_LAYERS_W = $clog2(MAX_LAYERS + 1)
+    // Derived sizes: don't override. (parameter, not localparam: Quartus rejects localparam here.)
+    parameter  IN_DIM_W    = $clog2(MAX_INPUTS + 1),
+    parameter  IN_INDEX_W  = $clog2(MAX_INPUTS),
+    parameter  OUT_DIM_W   = $clog2(MAX_OUTPUTS + 1),
+    parameter  MAX_BATCHES = (MAX_OUTPUTS + NUM_MACS - 1) / NUM_MACS,
+    parameter  BATCH_W     = (MAX_BATCHES > 1) ? $clog2(MAX_BATCHES) : 1,
+    parameter  LAYER_W     = (MAX_LAYERS > 1) ? $clog2(MAX_LAYERS) : 1,
+    parameter  NUM_LAYERS_W = $clog2(MAX_LAYERS + 1)
 )(
     input  logic                    clk,
     input  logic                    reset,

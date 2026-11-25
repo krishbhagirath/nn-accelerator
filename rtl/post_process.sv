@@ -25,7 +25,7 @@ module post_process (
     assign too_low  = relu_enable ? (shifted < 32'sd0) : (shifted < -32'sd128);
 
     assign result = too_high ? 8'sd127 :
-                    too_low  ? (relu_enable ? 8'sd0 : -8'sd128) :
+                    too_low  ? (relu_enable ? 8'sd0 : 8'sh80) :   // 8'sh80 = -128
                                shifted[7:0];
 
 endmodule

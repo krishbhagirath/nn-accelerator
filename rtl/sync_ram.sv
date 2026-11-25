@@ -12,7 +12,8 @@
 module sync_ram #(
     parameter WIDTH = 8,
     parameter DEPTH = 64,
-    localparam ADDR_W = (DEPTH > 1) ? $clog2(DEPTH) : 1
+    // Derived sizes: don't override. (parameter, not localparam: Quartus rejects localparam here.)
+    parameter  ADDR_W = (DEPTH > 1) ? $clog2(DEPTH) : 1
 )(
     input  logic              clk,
 

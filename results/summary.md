@@ -77,6 +77,15 @@ Latency reduction: 28.6% (1.40x fewer cycles).
 | 4 | 1905 | 460 | 4 | 4 | 198 | 3693 | 58.6 | 17.06 ns: lanes[2].weight_bank.read_data_LUT4_Z_2 -> lanes[2].mac.accumulator_TRELLIS_FF_Q_30 |
 | 8 | 4768 | 1742 | 8 | 8 | 70 | 6244 | 58.58 | 17.07 ns: lanes[7].weight_bank.read_data_LUT4_Z_1 -> lanes[7].mac.accumulator_TRELLIS_FF_Q_31 |
 
+## Synthesis (Intel Cyclone IV E, Quartus Prime Lite, out-of-context)
+
+| MACs | Device | Logic elements | Registers | Memory bits | 9-bit multipliers | Fmax (MHz, slow 85C) |
+|---|---|---|---|---|---|---|
+| 1 | EP4CE115F29C7 | 2659 | 1297 | 69632 | 1 | 75.1300 |
+| 2 | EP4CE115F29C7 | 2864 | 1325 | 69632 | 2 | 76.1400 |
+| 4 | EP4CE115F29C7 | 3311 | 1385 | 69632 | 4 | 67.7100 |
+| 8 | EP4CE115F29C7 | 4202 | 1509 | 69632 | 8 | 69.8600 |
+
 ## Throughput (DERIVED = post-route Fmax / measured compute cycles)
 
 Assumes weights are already loaded and excludes host I/O.

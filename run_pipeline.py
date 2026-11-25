@@ -6,6 +6,7 @@
 #   python run_pipeline.py test         Python unit tests + cocotb regression for 1/2/4/8 MACs
 #   python run_pipeline.py benchmark    every model x every MAC count + original design -> results/
 #   python run_pipeline.py synth        Yosys + nextpnr for 1/2/4/8 MACs -> results/
+#   python run_pipeline.py quartus      Intel Quartus (Cyclone IV E, DE2-115) for 1/2/4/8 MACs -> results/
 #   python run_pipeline.py report       rebuild results/summary.md from the CSV files
 #   python run_pipeline.py runtime      build and run the C++ Verilator runtime
 #   python run_pipeline.py demo --model digits --num-macs 4
@@ -15,6 +16,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -342,6 +344,16 @@ def cmd_report(args):
                          f"{r['critical_path_to']} |")
         lines.append("")
 
+    quartus = read_results("quartus_results.csv")
+    if quartus:
+        lines += ["## Synthesis (Intel Cyclone IV E, Quartus Prime Lite, out-of-context)", "",
+                  "| MACs | Device | Logic elements | Registers | Memory bits | 9-bit multipliers | Fmax (MHz, slow 85C) |",
+                  "|---|---|---|---|---|---|---|"]
+        for r in quartus:
+            lines.append(f"| {r['num_macs']} | {r['device']} | {r['logic_elements']} | {r['registers']} | "
+                         f"{r['memory_bits']} | {r['multipliers_9bit']} | {r['fmax_mhz']} |")
+        lines.append("")
+
     if synth and scaling:
         # DERIVED: measured cycles x measured post-route Fmax
         throughput = []
@@ -369,6 +381,42 @@ def cmd_report(args):
 
 def cmd_synth(args):
     run([sys.executable, PROJECT_ROOT / "synth" / "run_synth.py"])
+    cmd_report(args)
+
+
+def quartus_sh():
+    """quartus_sh from PATH, or from a default Quartus Prime Lite install."""
+    found = shutil.which("quartus_sh")
+    if found:
+        return found
+    installs = sorted(Path("C:/intelFPGA_lite").glob("*/quartus/bin64/quartus_sh.exe"))
+    if not installs:
+        raise SystemExit("Quartus not found: install Quartus Prime Lite or put quartus_sh on PATH")
+    return str(installs[-1])
+
+
+def cmd_quartus(args):
+    rows = []
+    for n in MAC_COUNTS:
+        out = BUILD_DIR / f"quartus_macs{n}"
+        out.mkdir(parents=True, exist_ok=True)
+        run([quartus_sh(), "-t", PROJECT_ROOT / "synth" / "quartus.tcl", n, RTL_DIR], cwd=out,
+            stdout=subprocess.DEVNULL)
+        fit = (out / "nn_accelerator.fit.summary").read_text()
+        sta = (out / "nn_accelerator.sta.rpt").read_text()
+        number = lambda label: int(re.search(label + r"\s*:\s*([\d,]+)", fit).group(1).replace(",", ""))
+        rows.append({
+            "num_macs": n,
+            "device": re.search(r"Device : (\S+)", fit).group(1),
+            "logic_elements": number("Total logic elements"),
+            "registers": number("Total registers"),
+            "memory_bits": number("Total memory bits"),
+            "multipliers_9bit": number("Embedded Multiplier 9-bit elements"),
+            # slowest corner (high temperature, low voltage): the number to trust
+            "fmax_mhz": float(re.search(r"; Slow \S+ 85C Model Fmax Summary\s*;.*?([\d.]+) MHz", sta, re.S).group(1)),
+        })
+        print(f"quartus NUM_MACS={n}: {rows[-1]}")
+    write_csv(RESULTS_DIR / "quartus_results.csv", rows, list(rows[0]))
     cmd_report(args)
 
 
@@ -435,7 +483,8 @@ def cmd_all(args):
 
 def main():
     commands = {"train": cmd_train, "compile": cmd_compile, "lint": cmd_lint, "test": cmd_test,
-                "benchmark": cmd_benchmark, "synth": cmd_synth, "report": cmd_report, "runtime": cmd_runtime,
+                "benchmark": cmd_benchmark, "synth": cmd_synth, "quartus": cmd_quartus, "report": cmd_report,
+                "runtime": cmd_runtime,
                 "demo": cmd_demo, "all": cmd_all}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=commands)

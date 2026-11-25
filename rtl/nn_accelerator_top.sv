@@ -35,20 +35,21 @@ module nn_accelerator_top #(
     parameter MAX_OUTPUTS = 32,
     parameter MAX_LAYERS  = 4,
 
-    localparam IN_DIM_W     = $clog2(MAX_INPUTS + 1),   // holds 0..MAX_INPUTS
-    localparam IN_INDEX_W   = $clog2(MAX_INPUTS),       // holds 0..MAX_INPUTS-1
-    localparam OUT_DIM_W    = $clog2(MAX_OUTPUTS + 1),
-    localparam OUT_INDEX_W  = $clog2(MAX_OUTPUTS),
-    localparam LAYER_W      = (MAX_LAYERS > 1) ? $clog2(MAX_LAYERS) : 1,
-    localparam NUM_LAYERS_W = $clog2(MAX_LAYERS + 1),
-    localparam MAX_BATCHES  = (MAX_OUTPUTS + NUM_MACS - 1) / NUM_MACS,
-    localparam BATCH_W      = (MAX_BATCHES > 1) ? $clog2(MAX_BATCHES) : 1,
-    localparam ROWS         = MAX_LAYERS * MAX_BATCHES,  // neuron rows per lane, all layers
-    localparam ROW_W        = $clog2(ROWS),
-    localparam BANK_DEPTH   = ROWS * MAX_INPUTS,
-    localparam BANK_ADDR_W  = $clog2(BANK_DEPTH),
-    localparam BUFFER_ROWS  = MAX_INPUTS / NUM_MACS,       // activation buffer rows
-    localparam BUFFER_ROW_W = (BUFFER_ROWS > 1) ? $clog2(BUFFER_ROWS) : 1
+    // Derived sizes: don't override. (parameter, not localparam: Quartus rejects localparam here.)
+    parameter  IN_DIM_W     = $clog2(MAX_INPUTS + 1),   // holds 0..MAX_INPUTS
+    parameter  IN_INDEX_W   = $clog2(MAX_INPUTS),       // holds 0..MAX_INPUTS-1
+    parameter  OUT_DIM_W    = $clog2(MAX_OUTPUTS + 1),
+    parameter  OUT_INDEX_W  = $clog2(MAX_OUTPUTS),
+    parameter  LAYER_W      = (MAX_LAYERS > 1) ? $clog2(MAX_LAYERS) : 1,
+    parameter  NUM_LAYERS_W = $clog2(MAX_LAYERS + 1),
+    parameter  MAX_BATCHES  = (MAX_OUTPUTS + NUM_MACS - 1) / NUM_MACS,
+    parameter  BATCH_W      = (MAX_BATCHES > 1) ? $clog2(MAX_BATCHES) : 1,
+    parameter  ROWS         = MAX_LAYERS * MAX_BATCHES,  // neuron rows per lane, all layers
+    parameter  ROW_W        = $clog2(ROWS),
+    parameter  BANK_DEPTH   = ROWS * MAX_INPUTS,
+    parameter  BANK_ADDR_W  = $clog2(BANK_DEPTH),
+    parameter  BUFFER_ROWS  = MAX_INPUTS / NUM_MACS,       // activation buffer rows
+    parameter  BUFFER_ROW_W = (BUFFER_ROWS > 1) ? $clog2(BUFFER_ROWS) : 1
 )(
     input  logic                    clk,
     input  logic                    reset,
